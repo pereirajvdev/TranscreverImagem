@@ -85,19 +85,20 @@ class TranscritorOCR(QThread):
         self.id_imagem = id_imagem
         self.imagem = imagem.copy()
 
+    
     def run(self):
         try:
+            import cv2
+            import numpy as np
+
             if not CAMINHO_TESSERACT:
                 raise RuntimeError(
                     "Tesseract não encontrado.\n\n"
-                    "Verifique se o arquivo existe em:\n"
-                    f"{PASTA_TESSERACT}\\tesseract.exe"
+                    f"Verifique o arquivo:\n{PASTA_TESSERACT}\\tesseract.exe"
                 )
 
             buffer = QBuffer()
-            buffer.open(
-                QIODevice.OpenModeFlag.WriteOnly
-            )
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
 
             if not self.imagem.save(buffer, "PNG"):
                 buffer.close()
@@ -108,16 +109,62 @@ class TranscritorOCR(QThread):
             dados = bytes(buffer.data())
             buffer.close()
 
-            with Image.open(BytesIO(dados)) as imagem:
-                imagem = imagem.convert("RGB")
+            
+            import cv2
+            import numpy as np
 
-                texto = pytesseract.image_to_string(
-                    imagem,
-                    lang="por+eng",
-                )
+            with Image.open(BytesIO(dados)) as original:
+                imagem = original.convert("RGB")
 
-            # Remove o caractere de quebra de página do Tesseract
-            # e espaços sobrando nas pontas.
+            # Converte a captura para tons de cinza.
+            imagem_cv = cv2.cvtColor(
+                np.array(imagem),
+                cv2.COLOR_RGB2GRAY,
+            )
+
+            # Amplia a imagem para facilitar a leitura de textos pequenos.
+            altura, largura = imagem_cv.shape
+
+            escala = 2.0 if largura < 2500 else 1.5
+
+            imagem_cv = cv2.resize(
+                imagem_cv,
+                None,
+                fx=escala,
+                fy=escala,
+                interpolation=cv2.INTER_CUBIC,
+            )
+
+            # Melhora suavemente o contraste sem binarizar a imagem.
+            imagem_cv = cv2.convertScaleAbs(
+                imagem_cv,
+                alpha=1.15,
+                beta=5,
+            )
+
+            # Cria uma margem branca para evitar cortes nas bordas.
+            imagem_cv = cv2.copyMakeBorder(
+                imagem_cv,
+                10, 10, 10, 10,
+                cv2.BORDER_CONSTANT,
+                value=255,
+            )
+
+            # Adequado como primeiro teste para um bloco de texto.
+            configuracao = (
+                "--oem 3 --psm 6 "
+                "-c preserve_interword_spaces=1"
+            )
+
+            texto = pytesseract.image_to_string(
+                imagem_cv,
+                lang="por",
+                config=configuracao,
+            )
+
+            texto = texto.replace("\x0c", "").strip()
+
+
             texto = texto.replace("\x0c", "").strip()
 
             if not texto:
@@ -125,10 +172,17 @@ class TranscritorOCR(QThread):
                     "Nenhum texto foi identificado na imagem."
                 )
 
-            self.concluido.emit(self.id_imagem, texto)
+            self.concluido.emit(
+                self.id_imagem,
+                texto,
+            )
 
         except Exception as exc:
-            self.erro.emit(self.id_imagem, str(exc))
+            self.erro.emit(
+                self.id_imagem,
+                str(exc),
+            )
+
 
 
 # ============================================================
@@ -635,6 +689,7 @@ class EditorTranscricao(QWidget):
     def limpar(self):
         self.editor_texto.limpar_conteudo()
         self.editor_texto.setFocus()
+
 
 
 # ============================================================
