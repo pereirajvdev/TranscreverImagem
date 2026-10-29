@@ -1,4 +1,4 @@
-import shutil
+
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -6,25 +6,18 @@ from pathlib import Path
 import pytesseract
 from PIL import Image
 
-from PySide6.QtCore import Qt, QThread, Signal, QBuffer, QIODevice, QUrl
-from PySide6.QtGui import (
-    QAction,
-    QImage,
-    QKeySequence,
-    QPixmap,
-    QTextCursor,
-    QTextImageFormat,
-    QTextDocument,
-    QTextFormat,
-)
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, QBuffer, QIODevice
+from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -39,8 +32,11 @@ TITULO_JANELA = "TranscreverImagem"
 
 PASTA_PROJETO = Path(__file__).resolve().parent.parent
 PASTA_TESSERACT = PASTA_PROJETO / "tesseract"
-
 CAMINHO_TESSERACT = PASTA_TESSERACT / "tesseract.exe"
+
+LARGURA_MAXIMA_IMAGEM = 800
+ALTURA_MAXIMA_IMAGEM = 600
+
 
 if CAMINHO_TESSERACT.exists():
     pytesseract.pytesseract.tesseract_cmd = str(
@@ -51,33 +47,35 @@ else:
 
 
 # ============================================================
-# THREAD DE RECONHECIMENTO DE TEXTO
+# TRANSCRITOR OCR
 # ============================================================
 
 class TranscritorOCR(QThread):
     concluido = Signal(str)
     erro = Signal(str)
 
-    def __init__(self, imagem: QImage):
-        super().__init__()
+    def __init__(self, imagem: QImage, parent=None):
+        super().__init__(parent)
         self.imagem = imagem.copy()
 
     def run(self):
         try:
             if not CAMINHO_TESSERACT:
                 raise RuntimeError(
-                    "Tesseract OCR não encontrado.\n\n"
-                    "Instale o Tesseract OCR ou configure "
-                    "o caminho do executável no código."
+                    "Tesseract não encontrado.\n\n"
+                    "Verifique se o arquivo existe em:\n"
+                    f"{PASTA_TESSERACT}\\tesseract.exe"
                 )
 
-            # Converte QImage para uma imagem PIL.
             buffer = QBuffer()
-            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            buffer.open(
+                QIODevice.OpenModeFlag.WriteOnly
+            )
 
             if not self.imagem.save(buffer, "PNG"):
+                buffer.close()
                 raise RuntimeError(
-                    "Não foi possível preparar a imagem."
+                    "Não foi possível converter a imagem."
                 )
 
             dados = bytes(buffer.data())
@@ -86,7 +84,6 @@ class TranscritorOCR(QThread):
             with Image.open(BytesIO(dados)) as imagem:
                 imagem = imagem.convert("RGB")
 
-                # Reconhece português e inglês.
                 texto = pytesseract.image_to_string(
                     imagem,
                     lang="por+eng",
@@ -104,170 +101,82 @@ class TranscritorOCR(QThread):
 
 
 # ============================================================
-# JANELA PRINCIPAL
+# EDITOR DE IMAGEM E TEXTO
 # ============================================================
-class EditorTranscricao(QTextEdit):
-    imagem_colada = Signal(QImage)
-    mouse_sobre_imagem = Signal(bool)
+
+class EditorTranscricao(QWidget):
+    transcrever_solicitado = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.setAcceptRichText(False)
-        self.setMouseTracking(True)
-
         self.imagem_atual = None
-        self.url_imagem = QUrl("transcreverimagem://imagem")
 
-    def insertFromMimeData(self, fonte):
-        # Se a área de transferência contiver uma imagem,
-        # insere a imagem diretamente no editor.
-        if fonte.hasImage():
-            dados = fonte.imageData()
-
-            if isinstance(dados, QPixmap):
-                imagem = dados.toImage()
-            elif isinstance(dados, QImage):
-                imagem = dados
-            else:
-                return
-
-            if imagem.isNull():
-                return
-
-            self.inserir_imagem(imagem)
-            self.imagem_colada.emit(imagem)
-            return
-
-        # Mantém a colagem normal de textos.
-        super().insertFromMimeData(fonte)
-
-    def inserir_imagem(self, imagem: QImage):
-        if imagem.isNull():
-            return
-
-        self.imagem_atual = imagem.copy()
-
-        # Limpa o documento antes de registrar a imagem.
-        self.clear()
-
-        self.document().addResource(
-            QTextDocument.ResourceType.ImageResource,
-            self.url_imagem,
-            self.imagem_atual,
-        )
-
-        formato = QTextImageFormat()
-        formato.setName(self.url_imagem.toString())
-
-        # Limita a largura ao espaço disponível no editor.
-        largura_maxima = max(100, self.viewport().width() - 30)
-
-        imagem_exibida = self.imagem_atual
-
-        if imagem_exibida.width() > largura_maxima:
-            imagem_exibida = imagem_exibida.scaledToWidth(
-                largura_maxima,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-
-        formato.setWidth(imagem_exibida.width())
-        formato.setHeight(imagem_exibida.height())
-
-        cursor = self.textCursor()
-        cursor.insertImage(formato)
-
-        self.setTextCursor(cursor)
-        self.setFocus()
-
-    def mouseMoveEvent(self, evento):
-        cursor = self.cursorForPosition(
-            evento.position().toPoint()
-        )
-
-        formato = cursor.charFormat()
-
-        sobre_imagem = (
-            formato.objectType()
-            == QTextFormat.ImageObject
-        )
-
-        # Verifica também o caractere anterior.
-        if not sobre_imagem and cursor.position() > 0:
-            cursor_anterior = QTextCursor(cursor)
-
-            cursor_anterior.movePosition(
-                QTextCursor.MoveOperation.PreviousCharacter
-            )
-
-            formato_anterior = cursor_anterior.charFormat()
-
-            sobre_imagem = (
-                formato_anterior.objectType()
-                == QTextFormat.ImageObject
-            )
-
-        self.mouse_sobre_imagem.emit(sobre_imagem)
-
-        super().mouseMoveEvent(evento)
-
-    def leaveEvent(self, evento):
-        self.mouse_sobre_imagem.emit(False)
-        super().leaveEvent(evento)
-
-
-class JanelaPrincipal(QMainWindow):
-
-    def __init__(self):
-        super().__init__()
-
-        self.imagem_atual = None
-        self.transcritor = None
-
-        self.setWindowTitle(TITULO_JANELA)
-        self.resize(950, 650)
-        self.setMinimumSize(650, 450)
+        self.setObjectName("editorTranscricao")
 
         self.criar_interface()
-        self.criar_menu()
-        self.aplicar_estilo()
 
-    # --------------------------------------------------------
-    # INTERFACE
-    # --------------------------------------------------------
+        self.timer_botao = QTimer(self)
+        self.timer_botao.setSingleShot(True)
+        self.timer_botao.setInterval(500)
+        self.timer_botao.timeout.connect(
+            self.botao_transcrever.hide
+        )
 
     def criar_interface(self):
-        central = QWidget()
-        self.setCentralWidget(central)
+        layout_principal = QVBoxLayout(self)
+        layout_principal.setContentsMargins(0, 0, 0, 0)
+        layout_principal.setSpacing(8)
 
-        layout_principal = QVBoxLayout(central)
-        layout_principal.setContentsMargins(18, 18, 18, 14)
-        layout_principal.setSpacing(12)
-
-        titulo = QLabel("TranscreverImagem")
-        titulo.setObjectName("titulo")
-
-        subtitulo = QLabel(
-            "Cole uma imagem com Ctrl+V ou digite seu texto."
+        # Área da imagem
+        self.container_imagem = QFrame(self)
+        self.container_imagem.setObjectName(
+            "containerImagem"
         )
-        subtitulo.setObjectName("subtitulo")
+        self.container_imagem.setFrameShape(
+            QFrame.Shape.NoFrame
+        )
+        self.container_imagem.setMouseTracking(True)
 
-        layout_principal.addWidget(titulo)
-        layout_principal.addWidget(subtitulo)
+        self.area_imagem = QLabel(
+            self.container_imagem
+        )
+        self.area_imagem.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.area_imagem.setMouseTracking(True)
 
-        # Um único campo para imagens e textos.
-        self.editor_texto = EditorTranscricao()
+        self.botao_transcrever = QPushButton(
+            "Transcrever",
+            self.container_imagem,
+        )
+        self.botao_transcrever.setObjectName(
+            "botaoTranscrever"
+        )
+        self.botao_transcrever.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.botao_transcrever.clicked.connect(
+            self.transcrever_solicitado.emit
+        )
+
+        self.area_imagem.installEventFilter(self)
+        self.botao_transcrever.installEventFilter(self)
+
+        self.botao_transcrever.hide()
+        self.container_imagem.hide()
+
+        layout_principal.addWidget(
+            self.container_imagem,
+            alignment=Qt.AlignmentFlag.AlignCenter,
+        )
+
+        # Área do texto
+        self.editor_texto = QTextEdit(self)
         self.editor_texto.setObjectName("editorTexto")
         self.editor_texto.setPlaceholderText(
-            "Digite seu texto ou cole uma imagem aqui..."
-        )
-
-        self.editor_texto.imagem_colada.connect(
-            self.imagem_recebida
-        )
-
-        self.editor_texto.mouse_sobre_imagem.connect(
-            self.alternar_botao_transcrever
+            "Cole uma imagem ou abra um arquivo para "
+            "começar a transcrição..."
         )
 
         layout_principal.addWidget(
@@ -275,173 +184,297 @@ class JanelaPrincipal(QMainWindow):
             stretch=1,
         )
 
-        barra_botoes = QHBoxLayout()
-        barra_botoes.setSpacing(10)
+    def definir_imagem(self, imagem: QImage):
+        if imagem.isNull():
+            return
 
-        self.botao_transcrever = QPushButton("Transcrever")
-        self.botao_transcrever.setObjectName("botaoPrincipal")
-        self.botao_transcrever.setMinimumHeight(38)
-        self.botao_transcrever.clicked.connect(
-            self.transcrever_imagem
+        self.timer_botao.stop()
+        self.imagem_atual = imagem.copy()
+
+        pixmap = QPixmap.fromImage(self.imagem_atual)
+
+        pixmap = pixmap.scaled(
+            LARGURA_MAXIMA_IMAGEM,
+            ALTURA_MAXIMA_IMAGEM,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
         )
+
+        self.area_imagem.setPixmap(pixmap)
+        self.area_imagem.setFixedSize(pixmap.size())
+
+        self.container_imagem.setFixedSize(
+            pixmap.size()
+        )
+
+        self.area_imagem.move(0, 0)
+
+        self.editor_texto.clear()
+        self.editor_texto.hide()
+
+        self.container_imagem.show()
         self.botao_transcrever.hide()
 
+        self.posicionar_botao()
+
+    def posicionar_botao(self):
+        self.botao_transcrever.adjustSize()
+
+        margem = 8
+
+        x = max(
+            margem,
+            self.container_imagem.width()
+            - self.botao_transcrever.width()
+            - margem,
+        )
+
+        self.botao_transcrever.move(x, margem)
+        self.botao_transcrever.raise_()
+
+    def eventFilter(self, objeto, evento):
+        if objeto in (
+            self.area_imagem,
+            self.botao_transcrever,
+        ):
+            if evento.type() == evento.Type.Enter:
+                self.timer_botao.stop()
+
+                if self.imagem_atual is not None:
+                    self.botao_transcrever.show()
+                    self.botao_transcrever.raise_()
+
+            elif evento.type() == evento.Type.Leave:
+                self.timer_botao.start()
+
+        return super().eventFilter(objeto, evento)
+
+    def mostrar_texto(self, texto: str):
+        self.timer_botao.stop()
+
+        self.container_imagem.hide()
+        self.botao_transcrever.hide()
+
+        self.editor_texto.setPlainText(texto)
+        self.editor_texto.show()
+        self.editor_texto.setFocus()
+
+    def limpar(self):
+        self.timer_botao.stop()
+
+        self.imagem_atual = None
+
+        self.container_imagem.hide()
+        self.botao_transcrever.hide()
+
+        self.editor_texto.clear()
+        self.editor_texto.show()
+
+    def definir_estado_transcricao(
+        self,
+        em_andamento: bool,
+    ):
+        self.botao_transcrever.setEnabled(
+            not em_andamento
+        )
+
+        self.botao_transcrever.setText(
+            "Transcrevendo..."
+            if em_andamento
+            else "Transcrever"
+        )
+
+
+# ============================================================
+# JANELA PRINCIPAL
+# ============================================================
+
+class JanelaPrincipal(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+
+        self.transcritor = None
+
+        self.setWindowTitle(TITULO_JANELA)
+        self.resize(1000, 750)
+        self.setMinimumSize(600, 450)
+
+        self.criar_interface()
+        self.configurar_atalhos()
+        self.aplicar_estilo()
+
+        self.statusBar().showMessage(
+            "Pronto para transcrever."
+        )
+
+    def criar_interface(self):
+        central = QWidget(self)
+        self.setCentralWidget(central)
+
+        layout_principal = QVBoxLayout(central)
+        layout_principal.setContentsMargins(
+            16, 16, 16, 12
+        )
+        layout_principal.setSpacing(12)
+
+        # Título
+        self.titulo = QLabel("Transcrever imagem")
+        self.titulo.setObjectName("titulo")
+
+        layout_principal.addWidget(self.titulo)
+
+        # Editor
+        self.editor = EditorTranscricao(self)
+
+        self.editor.transcrever_solicitado.connect(
+            self.transcrever_imagem
+        )
+
+        # Área rolável para imagens maiores
+        self.area_rolagem = QScrollArea(self)
+        self.area_rolagem.setObjectName("areaRolagem")
+        self.area_rolagem.setWidgetResizable(True)
+        self.area_rolagem.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.area_rolagem.setWidget(self.editor)
+
+        layout_principal.addWidget(
+            self.area_rolagem,
+            stretch=1,
+        )
+
+        # Botões inferiores
+        layout_botoes = QHBoxLayout()
+        layout_botoes.setSpacing(8)
+
+        self.botao_abrir = QPushButton("Abrir imagem")
+        self.botao_abrir.clicked.connect(
+            self.abrir_imagem
+        )
+
+        self.botao_colar = QPushButton("Colar imagem")
+        self.botao_colar.clicked.connect(
+            self.colar_conteudo
+        )
+
         self.botao_copiar = QPushButton("Copiar texto")
-        self.botao_copiar.setMinimumHeight(38)
         self.botao_copiar.clicked.connect(
             self.copiar_texto
         )
         self.botao_copiar.hide()
 
-        self.botao_nova_imagem = QPushButton("Nova imagem")
-        self.botao_nova_imagem.setMinimumHeight(38)
-        self.botao_nova_imagem.clicked.connect(
-            self.paste_image
+        self.botao_nova = QPushButton("Nova imagem")
+        self.botao_nova.clicked.connect(
+            self.nova_imagem
         )
 
-        barra_botoes.addWidget(self.botao_transcrever)
-        barra_botoes.addWidget(self.botao_copiar)
-        barra_botoes.addStretch()
-        barra_botoes.addWidget(self.botao_nova_imagem)
+        layout_botoes.addWidget(self.botao_abrir)
+        layout_botoes.addWidget(self.botao_colar)
+        layout_botoes.addStretch()
+        layout_botoes.addWidget(self.botao_copiar)
+        layout_botoes.addWidget(self.botao_nova)
 
-        layout_principal.addLayout(barra_botoes)
-
-        self.statusBar().showMessage("Pronto")
-
-        # O cursor já fica pronto para digitação.
-        self.editor_texto.setFocus()
-
-    # --------------------------------------------------------
-    # MENU
-    # --------------------------------------------------------
-
-    def criar_menu(self):
-        menu_arquivo = self.menuBar().addMenu("Arquivo")
-        menu_editar = self.menuBar().addMenu("Editar")
-
-        acao_abrir = QAction("Abrir imagem...", self)
-        acao_abrir.setShortcut("Ctrl+O")
-        acao_abrir.triggered.connect(self.abrir_imagem)
-
-        acao_salvar = QAction("Salvar texto...", self)
-        acao_salvar.setShortcut("Ctrl+S")
-        acao_salvar.triggered.connect(self.salvar_texto)
-
-        acao_sair = QAction("Sair", self)
-        acao_sair.triggered.connect(self.close)
-
-        acao_colar = QAction("Colar imagem", self)
-        acao_colar.setShortcut("Ctrl+V")
-        acao_colar.triggered.connect(self.paste_image)
-
-        menu_arquivo.addAction(acao_abrir)
-        menu_arquivo.addAction(acao_salvar)
-        menu_arquivo.addSeparator()
-        menu_arquivo.addAction(acao_sair)
-
-        menu_editar.addAction(acao_colar)
-
-    # --------------------------------------------------------
-    # ATALHOS
-    # --------------------------------------------------------
+        layout_principal.addLayout(layout_botoes)
 
     def configurar_atalhos(self):
-        self.atalho_colar = QShortcut(
-            QKeySequence.StandardKey.Paste,
+        self.atalho_abrir = QShortcut(
+            QKeySequence("Ctrl+O"),
             self,
         )
-        self.atalho_colar.setContext(
-            Qt.ShortcutContext.WindowShortcut
-        )
-        self.atalho_colar.activated.connect(self.paste_image)
-
-    # --------------------------------------------------------
-    # COLAR IMAGEM
-    # --------------------------------------------------------
-
-    def paste_image(self):
-        clipboard = QApplication.clipboard()
-        imagem = clipboard.image()
-
-        if not imagem.isNull():
-            self.editor_texto.inserir_imagem(imagem)
-            self.imagem_recebida(imagem)
-            return
-
-        mime_data = clipboard.mimeData()
-
-        if mime_data.hasText():
-            self.editor_texto.setFocus()
-            self.editor_texto.insertPlainText(
-                mime_data.text()
-            )
-            return
-
-        self.statusBar().showMessage(
-            "Nenhuma imagem encontrada na área de transferência."
+        self.atalho_abrir.activated.connect(
+            self.abrir_imagem
         )
 
-    def definir_imagem(self, imagem: QImage):
-        self.imagem_atual = imagem.copy()
-
-        pixmap = QPixmap.fromImage(self.imagem_atual)
-
-        pixmap_ajustado = pixmap.scaled(
-            self.area_imagem.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+        self.atalho_colar = QShortcut(
+            QKeySequence("Ctrl+V"),
+            self,
+        )
+        self.atalho_colar.activated.connect(
+            self.colar_conteudo
         )
 
-        self.area_imagem.setPixmap(pixmap_ajustado)
-
-        self.area_conteudo.setCurrentWidget(self.area_imagem)
-
-        self.botao_transcrever.setVisible(True)
-        self.botao_copiar.setVisible(False)
-
-        self.statusBar().showMessage(
-            f"Imagem carregada: "
-            f"{imagem.width()} × {imagem.height()} pixels"
+        self.atalho_copiar = QShortcut(
+            QKeySequence("Ctrl+Shift+C"),
+            self,
+        )
+        self.atalho_copiar.activated.connect(
+            self.copiar_texto
         )
 
+    def aplicar_estilo(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f6f8;
+            }
 
-    def imagem_recebida(self, imagem):
-        self.botao_transcrever.hide()
-        self.botao_copiar.hide()
+            QLabel#titulo {
+                color: #202124;
+                font-size: 22px;
+                font-weight: bold;
+                padding-bottom: 4px;
+            }
 
-        self.statusBar().showMessage(
-            f"Imagem carregada: "
-            f"{imagem.width()} × {imagem.height()} pixels"
-        )
+            QScrollArea#areaRolagem {
+                background-color: #ffffff;
+                border: 1px solid #d9dde3;
+                border-radius: 8px;
+            }
 
+            QWidget#editorTranscricao {
+                background-color: #ffffff;
+            }
 
-    def alternar_botao_transcrever(self, sobre_imagem):
-        tem_imagem = self.editor_texto.imagem_atual is not None
+            QFrame#containerImagem {
+                background-color: #ffffff;
+                border: none;
+            }
 
-        self.botao_transcrever.setVisible(
-            sobre_imagem
-            and tem_imagem
-            and self.botao_transcrever.isEnabled()
-        )
+            QTextEdit#editorTexto {
+                background-color: #ffffff;
+                color: #202124;
+                border: 1px solid #d9dde3;
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 14px;
+                selection-background-color: #cfe2ff;
+            }
 
+            QPushButton {
+                background-color: #e8eaed;
+                color: #202124;
+                border: none;
+                border-radius: 6px;
+                padding: 9px 14px;
+                font-size: 13px;
+            }
 
-    def resizeEvent(self, evento):
-        super().resizeEvent(evento)
+            QPushButton:hover {
+                background-color: #d9dde3;
+            }
 
-        if self.imagem_atual is not None:
-            if (
-                self.area_conteudo.currentWidget()
-                == self.area_imagem
-            ):
-                pixmap = QPixmap.fromImage(self.imagem_atual)
+            QPushButton:disabled {
+                background-color: #e8eaed;
+                color: #777777;
+            }
 
-                self.area_imagem.setPixmap(
-                    pixmap.scaled(
-                        self.area_imagem.size(),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
+            QPushButton#botaoTranscrever {
+                background-color: #1769e0;
+                color: white;
+                font-weight: bold;
+                padding: 8px 12px;
+            }
+
+            QPushButton#botaoTranscrever:hover {
+                background-color: #0f57bd;
+            }
+
+            QPushButton#botaoTranscrever:disabled {
+                background-color: #7da9e8;
+                color: white;
+            }
+        """)
 
     # --------------------------------------------------------
     # ABRIR IMAGEM
@@ -453,8 +486,8 @@ class JanelaPrincipal(QMainWindow):
             "Abrir imagem",
             "",
             (
-                "Imagens (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;"
-                "Todos os arquivos (*)"
+                "Imagens (*.png *.jpg *.jpeg *.bmp "
+                "*.tif *.tiff *.webp);;Todos os arquivos (*)"
             ),
         )
 
@@ -474,41 +507,103 @@ class JanelaPrincipal(QMainWindow):
         self.definir_imagem(imagem)
 
     # --------------------------------------------------------
+    # COLAR IMAGEM OU TEXTO
+    # --------------------------------------------------------
+
+    def colar_conteudo(self):
+        clipboard = QApplication.clipboard()
+        imagem = clipboard.image()
+
+        if not imagem.isNull():
+            self.definir_imagem(imagem)
+            return
+
+        texto = clipboard.text()
+
+        if texto:
+            if self.editor.imagem_atual is not None:
+                self.editor.limpar()
+
+            self.editor.editor_texto.show()
+            self.editor.editor_texto.insertPlainText(texto)
+            self.editor.editor_texto.setFocus()
+
+            self.botao_copiar.show()
+
+            self.statusBar().showMessage(
+                "Texto colado."
+            )
+            return
+
+        self.statusBar().showMessage(
+            "A área de transferência não contém imagem ou texto."
+        )
+
+    # --------------------------------------------------------
+    # DEFINIR IMAGEM
+    # --------------------------------------------------------
+
+    def definir_imagem(self, imagem: QImage):
+        if imagem.isNull():
+            return
+
+        self.editor.definir_imagem(imagem)
+
+        self.botao_copiar.hide()
+
+        self.statusBar().showMessage(
+            f"Imagem carregada: {imagem.width()} × "
+            f"{imagem.height()} pixels"
+        )
+
+    # --------------------------------------------------------
     # TRANSCRIÇÃO
     # --------------------------------------------------------
 
     def transcrever_imagem(self):
-        if self.editor_texto.imagem_atual is None:
+        imagem = self.editor.imagem_atual
+
+        if imagem is None:
             return
 
-        self.botao_transcrever.setEnabled(False)
-        self.botao_transcrever.setText("Transcrevendo...")
+        if self.transcritor is not None:
+            if self.transcritor.isRunning():
+                return
+
+        self.editor.definir_estado_transcricao(True)
+
+        self.botao_abrir.setEnabled(False)
+        self.botao_colar.setEnabled(False)
+        self.botao_nova.setEnabled(False)
+
         self.statusBar().showMessage(
-            "Reconhecendo os textos da imagem..."
+            "Transcrevendo imagem..."
         )
 
         self.transcritor = TranscritorOCR(
-            self.editor_texto.imagem_atual
+            imagem,
+            self,
         )
 
-        self.transcritor.concluido.connect(
+        trabalhador = self.transcritor
+
+        trabalhador.concluido.connect(
             self.transcricao_concluida
         )
-        self.transcritor.erro.connect(
+
+        trabalhador.erro.connect(
             self.transcricao_com_erro
         )
-        self.transcritor.finished.connect(
-            self.transcritor.deleteLater
+
+        trabalhador.finished.connect(
+            self.liberar_transcritor
         )
 
-        self.transcritor.start()
+        trabalhador.start()
 
     def transcricao_concluida(self, texto: str):
-        self.editor_texto.setPlainText(texto)
-        self.editor_texto.imagem_atual = None
-        self.editor_texto.setFocus()
+        self.editor.mostrar_texto(texto)
 
-        self.botao_transcrever.hide()
         self.botao_copiar.show()
 
         self.statusBar().showMessage(
@@ -518,160 +613,88 @@ class JanelaPrincipal(QMainWindow):
         self.finalizar_transcricao()
 
     def transcricao_com_erro(self, mensagem: str):
+        self.finalizar_transcricao()
+
         QMessageBox.critical(
             self,
             "Erro na transcrição",
-            (
-                "Não foi possível transcrever a imagem.\n\n"
-                f"{mensagem}\n\n"
-                "Verifique se o Tesseract está instalado e "
-                "se os idiomas por e eng estão disponíveis."
-            ),
+            mensagem,
         )
 
         self.statusBar().showMessage(
-            "Falha na transcrição."
+            "Não foi possível concluir a transcrição."
         )
 
-        self.finalizar_transcricao()
-
     def finalizar_transcricao(self):
-        self.botao_transcrever.setEnabled(True)
-        self.botao_transcrever.setText("Transcrever")
-        self.transcritor = None
+        self.editor.definir_estado_transcricao(False)
+
+        self.botao_abrir.setEnabled(True)
+        self.botao_colar.setEnabled(True)
+        self.botao_nova.setEnabled(True)
+
+    def liberar_transcritor(self):
+        trabalhador = self.sender()
+
+        if trabalhador is self.transcritor:
+            self.transcritor = None
+
+        trabalhador.deleteLater()
 
     # --------------------------------------------------------
-    # TEXTO
+    # COPIAR TEXTO
     # --------------------------------------------------------
 
     def copiar_texto(self):
-        texto = self.editor_texto.toPlainText()
+        texto = self.editor.editor_texto.toPlainText()
 
-        if not texto:
+        if not texto.strip():
+            self.statusBar().showMessage(
+                "Não há texto para copiar."
+            )
             return
 
         QApplication.clipboard().setText(texto)
+
         self.statusBar().showMessage(
             "Texto copiado para a área de transferência."
         )
 
-    def salvar_texto(self):
-        caminho, _ = QFileDialog.getSaveFileName(
-            self,
-            "Salvar texto transcrito",
-            "transcricao.txt",
-            "Arquivos de texto (*.txt);;Todos os arquivos (*)",
+    # --------------------------------------------------------
+    # NOVA IMAGEM
+    # --------------------------------------------------------
+
+    def nova_imagem(self):
+        self.editor.limpar()
+
+        self.botao_copiar.hide()
+
+        self.statusBar().showMessage(
+            "Aguardando uma nova imagem."
         )
 
-        if not caminho:
+    # --------------------------------------------------------
+    # FECHAMENTO
+    # --------------------------------------------------------
+
+    def closeEvent(self, evento):
+        if (
+            self.transcritor is not None
+            and self.transcritor.isRunning()
+        ):
+            QMessageBox.information(
+                self,
+                "Transcrição em andamento",
+                "Aguarde a conclusão da transcrição "
+                "antes de fechar o aplicativo.",
+            )
+            evento.ignore()
             return
 
-        try:
-            Path(caminho).write_text(
-                self.editor_texto.toPlainText(),
-                encoding="utf-8",
-            )
-
-            self.statusBar().showMessage(
-                "Texto salvo com sucesso."
-            )
-
-        except OSError as exc:
-            QMessageBox.critical(
-                self,
-                "Erro ao salvar",
-                str(exc),
-            )
-
-    # --------------------------------------------------------
-    # ESTILO
-    # --------------------------------------------------------
-
-    def aplicar_estilo(self):
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f5f6f8;
-            }
-
-            QLabel#titulo {
-                color: #202124;
-                font-size: 23px;
-                font-weight: bold;
-            }
-
-            QLabel#subtitulo {
-                color: #666b73;
-                font-size: 13px;
-                padding-bottom: 5px;
-            }
-
-            QStackedWidget {
-                background-color: white;
-                border: 1px solid #d8dce2;
-                border-radius: 8px;
-            }
-
-            QLabel#areaImagem {
-                color: #737983;
-                background-color: white;
-                padding: 12px;
-            }
-
-            QTextEdit#editorTexto {
-                color: #202124;
-                background-color: white;
-                border: none;
-                padding: 14px;
-                font-family: Consolas;
-                font-size: 14px;
-                selection-background-color: #c9ddff;
-            }
-
-            QPushButton {
-                background-color: white;
-                color: #30343b;
-                border: 1px solid #d0d5dc;
-                border-radius: 5px;
-                padding: 8px 16px;
-            }
-
-            QPushButton:hover {
-                background-color: #edf1f7;
-            }
-
-            QPushButton:disabled {
-                color: #8b9098;
-            }
-
-            QPushButton#botaoPrincipal {
-                background-color: #2463eb;
-                color: white;
-                border: none;
-                font-weight: bold;
-                min-width: 110px;
-            }
-
-            QPushButton#botaoPrincipal:hover {
-                background-color: #1d4fc4;
-            }
-
-            QMenuBar {
-                background-color: #f5f6f8;
-                color: #202124;
-            }
-
-            QMenuBar::item:selected {
-                background-color: #e4e8ef;
-            }
-
-            QStatusBar {
-                color: #626873;
-            }
-        """)
+        evento.accept()
 
 
 # ============================================================
-# INICIALIZAÇÃO
+# EXECUÇÃO
 # ============================================================
 
 def main():
