@@ -6,8 +6,22 @@ from pathlib import Path
 import pytesseract
 from PIL import Image
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, QBuffer, QIODevice
-from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    QBuffer,
+    QIODevice,
+    QMimeData,
+)
+from PySide6.QtGui import (
+    QImage,
+    QPixmap,
+    QKeySequence,
+    QShortcut,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -33,9 +47,6 @@ TITULO_JANELA = "TranscreverImagem"
 PASTA_PROJETO = Path(__file__).resolve().parent.parent
 PASTA_TESSERACT = PASTA_PROJETO / "tesseract"
 CAMINHO_TESSERACT = PASTA_TESSERACT / "tesseract.exe"
-
-LARGURA_MAXIMA_IMAGEM = 800
-ALTURA_MAXIMA_IMAGEM = 600
 
 
 if CAMINHO_TESSERACT.exists():
@@ -103,7 +114,40 @@ class TranscritorOCR(QThread):
 # ============================================================
 # EDITOR DE IMAGEM E TEXTO
 # ============================================================
+class EditorTexto(QTextEdit):
+    imagem_colada = Signal(QImage)
 
+    def insertFromMimeData(self, source: QMimeData):
+        if self.parent().imagem_atual is not None:
+            # Não permite inserir texto ou outra imagem
+            # enquanto já existir uma imagem carregada.
+            return
+
+        if source.hasImage():
+            imagem = source.imageData()
+
+            if isinstance(imagem, QImage) and not imagem.isNull():
+                self.imagem_colada.emit(imagem.copy())
+                return
+
+            if isinstance(imagem, QPixmap) and not imagem.isNull():
+                self.imagem_colada.emit(imagem.toImage())
+                return
+
+        # Permite colar texto somente quando não há imagem.
+        super().insertFromMimeData(source)
+
+    def keyPressEvent(self, evento):
+        if self.parent().imagem_atual is not None:
+            # Permite copiar a imagem, mas bloqueia alterações.
+            if evento.matches(QKeySequence.StandardKey.Copy):
+                super().keyPressEvent(evento)
+                return
+
+            return
+
+        super().keyPressEvent(evento)
+        
 class EditorTranscricao(QWidget):
     transcrever_solicitado = Signal()
 
@@ -123,6 +167,17 @@ class EditorTranscricao(QWidget):
             self.botao_transcrever.hide
         )
 
+    def imagem_colada_no_editor(self, imagem: QImage):
+        if imagem.isNull():
+            return
+
+        self.transcrever_solicitado_imagem = imagem.copy()
+
+        janela = self.window()
+
+        if hasattr(janela, "definir_imagem"):
+            janela.definir_imagem(imagem)
+            
     def criar_interface(self):
         layout_principal = QVBoxLayout(self)
         layout_principal.setContentsMargins(0, 0, 0, 0)
@@ -148,7 +203,7 @@ class EditorTranscricao(QWidget):
 
         self.botao_transcrever = QPushButton(
             "Transcrever",
-            self.container_imagem,
+            self,
         )
         self.botao_transcrever.setObjectName(
             "botaoTranscrever"
@@ -172,11 +227,15 @@ class EditorTranscricao(QWidget):
         )
 
         # Área do texto
-        self.editor_texto = QTextEdit(self)
+        self.editor_texto = EditorTexto(self)
         self.editor_texto.setObjectName("editorTexto")
+        self.editor_texto.setAcceptRichText(True)
         self.editor_texto.setPlaceholderText(
-            "Cole uma imagem ou abra um arquivo para "
-            "começar a transcrição..."
+            "Cole uma imagem ou digite seu texto..."
+        )
+
+        self.editor_texto.imagem_colada.connect(
+            self.imagem_colada_no_editor
         )
 
         layout_principal.addWidget(
@@ -191,45 +250,37 @@ class EditorTranscricao(QWidget):
         self.timer_botao.stop()
         self.imagem_atual = imagem.copy()
 
-        pixmap = QPixmap.fromImage(self.imagem_atual)
+        self.container_imagem.hide()
+        self.editor_texto.show()
 
-        pixmap = pixmap.scaled(
-            LARGURA_MAXIMA_IMAGEM,
-            ALTURA_MAXIMA_IMAGEM,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        cursor = self.editor_texto.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.insertImage(QPixmap.fromImage(imagem).toImage())
 
-        self.area_imagem.setPixmap(pixmap)
-        self.area_imagem.setFixedSize(pixmap.size())
+        self.editor_texto.setTextCursor(cursor)
+        self.editor_texto.setFocus()
 
-        self.container_imagem.setFixedSize(
-            pixmap.size()
-        )
-
-        self.area_imagem.move(0, 0)
-
-        self.editor_texto.clear()
-        self.editor_texto.hide()
-
-        self.container_imagem.show()
-        self.botao_transcrever.hide()
-
+        self.botao_transcrever.adjustSize()
         self.posicionar_botao()
+
+        self.botao_transcrever.show()
+        self.botao_transcrever.raise_()
 
     def posicionar_botao(self):
         self.botao_transcrever.adjustSize()
 
-        margem = 8
+        margem = 16
 
         x = max(
             margem,
-            self.container_imagem.width()
+            self.editor_texto.geometry().right()
             - self.botao_transcrever.width()
             - margem,
         )
 
-        self.botao_transcrever.move(x, margem)
+        y = self.editor_texto.geometry().top() + margem
+
+        self.botao_transcrever.move(x, y)
         self.botao_transcrever.raise_()
 
     def eventFilter(self, objeto, evento):
@@ -512,6 +563,7 @@ class JanelaPrincipal(QMainWindow):
 
     def colar_conteudo(self):
         clipboard = QApplication.clipboard()
+
         imagem = clipboard.image()
 
         if not imagem.isNull():
@@ -521,18 +573,13 @@ class JanelaPrincipal(QMainWindow):
         texto = clipboard.text()
 
         if texto:
-            if self.editor.imagem_atual is not None:
-                self.editor.limpar()
-
             self.editor.editor_texto.show()
-            self.editor.editor_texto.insertPlainText(texto)
             self.editor.editor_texto.setFocus()
+            self.editor.editor_texto.insertPlainText(texto)
 
             self.botao_copiar.show()
 
-            self.statusBar().showMessage(
-                "Texto colado."
-            )
+            self.statusBar().showMessage("Texto colado.")
             return
 
         self.statusBar().showMessage(
