@@ -706,9 +706,9 @@ class NotaWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Cabeçalho da nota
+        # Cabeçalho compacto
         cabecalho = QHBoxLayout()
-        cabecalho.setContentsMargins(6, 2, 4, 2)
+        cabecalho.setContentsMargins(4, 0, 2, 0)
         cabecalho.setSpacing(2)
 
         self.titulo = QLabel(f"Nota {self.numero}")
@@ -716,7 +716,7 @@ class NotaWidget(QWidget):
 
         self.botao_fechar = QPushButton("×")
         self.botao_fechar.setObjectName("botaoFecharNota")
-        self.botao_fechar.setFixedSize(30, 30)
+        self.botao_fechar.setFixedSize(24, 24)
         self.botao_fechar.setToolTip("Fechar nota")
         self.botao_fechar.setCursor(
             Qt.CursorShape.PointingHandCursor
@@ -731,14 +731,14 @@ class NotaWidget(QWidget):
 
         layout.addLayout(cabecalho)
 
-        # Editor independente
+        # Editor: ocupa todo o espaço vertical disponível
         self.editor = EditorTranscricao(self)
         layout.addWidget(self.editor, stretch=1)
 
-        # Botões da nota
+        # Controles inferiores compactos
         layout_botoes = QHBoxLayout()
-        layout_botoes.setContentsMargins(4, 2, 4, 2)
-        layout_botoes.setSpacing(4)
+        layout_botoes.setContentsMargins(2, 2, 2, 2)
+        layout_botoes.setSpacing(3)
 
         self.botao_transcrever = QPushButton("Transcrever")
         self.botao_transcrever.setObjectName(
@@ -773,12 +773,13 @@ class NotaWidget(QWidget):
             self.atualizar_botao_copiar
         )
 
-        # Registrar qual nota está sendo utilizada
+        # Registrar a nota ativa ao receber foco
         self.editor.editor_texto.focusInEvent = (
             self._criar_focus_handler(
                 self.editor.editor_texto.focusInEvent
             )
         )
+
 
     def _criar_focus_handler(self, handler_original):
         def handler(evento):
@@ -996,7 +997,6 @@ class NotaWidget(QWidget):
 # ============================================================
 # JANELA PRINCIPAL
 # ============================================================
-
 
 class JanelaPrincipal(QMainWindow):
 
