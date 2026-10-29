@@ -117,12 +117,99 @@ class TranscritorOCR(QThread):
 class EditorTexto(QTextEdit):
     imagem_colada = Signal(QImage)
 
-    def insertFromMimeData(self, source: QMimeData):
-        if self.parent().imagem_atual is not None:
-            # Não permite inserir texto ou outra imagem
-            # enquanto já existir uma imagem carregada.
-            return
+    def bloco_contem_imagem(self, bloco):
+        it = bloco.begin()
 
+        while not it.atEnd():
+            fragmento = it.fragment()
+
+            if (
+                fragmento.isValid()
+                and fragmento.charFormat().isImageFormat()
+            ):
+                return True
+
+            it += 1
+
+        return False
+
+    def pular_linha_da_imagem(self):
+        cursor = self.textCursor()
+        bloco = cursor.block()
+
+        if not self.bloco_contem_imagem(bloco):
+            return False
+
+        # Identifica a posição da imagem.
+        it = bloco.begin()
+        posicao_imagem = None
+
+        while not it.atEnd():
+            fragmento = it.fragment()
+
+            if (
+                fragmento.isValid()
+                and fragmento.charFormat().isImageFormat()
+            ):
+                posicao_imagem = fragmento.position()
+                break
+
+            it += 1
+
+        if posicao_imagem is None:
+            return False
+
+        documento = self.document()
+
+        # Se o cursor estiver antes da imagem,
+        # cria uma linha acima dela.
+        if cursor.position() <= posicao_imagem:
+            cursor.setPosition(bloco.position())
+            cursor.insertBlock()
+
+            cursor.movePosition(
+                QTextCursor.MoveOperation.PreviousBlock
+            )
+            cursor.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock
+            )
+
+        # Se estiver depois da imagem,
+        # cria uma linha abaixo dela.
+        else:
+            cursor.setPosition(bloco.position())
+            cursor.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock
+            )
+            cursor.insertBlock()
+
+        self.setTextCursor(cursor)
+        return True
+
+    def keyPressEvent(self, evento):
+        modificadores = evento.modifiers()
+
+        # Trata a digitação de caracteres e a tecla Enter.
+        digitando = (
+            bool(evento.text())
+            and not (
+                modificadores
+                & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                )
+            )
+        ) or evento.key() in (
+            Qt.Key.Key_Return,
+            Qt.Key.Key_Enter,
+        )
+
+        if digitando:
+            self.pular_linha_da_imagem()
+
+        super().keyPressEvent(evento)
+
+    def insertFromMimeData(self, source: QMimeData):
         if source.hasImage():
             imagem = source.imageData()
 
@@ -134,20 +221,13 @@ class EditorTexto(QTextEdit):
                 self.imagem_colada.emit(imagem.toImage())
                 return
 
-        # Permite colar texto somente quando não há imagem.
+        # Se houver texto colado sobre o parágrafo da imagem,
+        # desloca o cursor para um parágrafo adjacente.
+        if self.bloco_contem_imagem(self.textCursor().block()):
+            self.pular_linha_da_imagem()
+
         super().insertFromMimeData(source)
 
-    def keyPressEvent(self, evento):
-        if self.parent().imagem_atual is not None:
-            # Permite copiar a imagem, mas bloqueia alterações.
-            if evento.matches(QKeySequence.StandardKey.Copy):
-                super().keyPressEvent(evento)
-                return
-
-            return
-
-        super().keyPressEvent(evento)
-        
 class EditorTranscricao(QWidget):
     transcrever_solicitado = Signal()
 
@@ -167,6 +247,36 @@ class EditorTranscricao(QWidget):
             self.botao_transcrever.hide
         )
 
+    def listar_linhas(self):
+        documento = self.editor_texto.document()
+        bloco = documento.begin()
+        numero_linha = 1
+
+        while bloco.isValid():
+            texto = bloco.text()
+            tem_imagem = False
+
+            it = bloco.begin()
+
+            while not it.atEnd():
+                fragmento = it.fragment()
+
+                if fragmento.isValid():
+                    formato = fragmento.charFormat()
+
+                    if formato.isImageFormat():
+                        tem_imagem = True
+                        break
+
+                it += 1
+
+            tipo = "CONTÉM IMAGEM" if tem_imagem else "TEXTO"
+
+            print(f"Linha {numero_linha}: [{tipo}] {texto!r}")
+
+            numero_linha += 1
+            bloco = bloco.next()
+            
     def imagem_colada_no_editor(self, imagem: QImage):
         if imagem.isNull():
             return
@@ -244,25 +354,25 @@ class EditorTranscricao(QWidget):
         )
 
     def definir_imagem(self, imagem: QImage):
-        if imagem.isNull():
-            return
-
-        self.timer_botao.stop()
         self.imagem_atual = imagem.copy()
 
         self.container_imagem.hide()
         self.editor_texto.show()
 
+        # Limpa o conteúdo anterior.
+        self.editor_texto.clear()
+
+        # Insere a imagem em um parágrafo próprio.
         cursor = self.editor_texto.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.insertBlock()
         cursor.insertImage(QPixmap.fromImage(imagem).toImage())
+        cursor.insertBlock()
 
         self.editor_texto.setTextCursor(cursor)
         self.editor_texto.setFocus()
 
-        self.botao_transcrever.adjustSize()
         self.posicionar_botao()
-
         self.botao_transcrever.show()
         self.botao_transcrever.raise_()
 
@@ -297,7 +407,10 @@ class EditorTranscricao(QWidget):
 
             elif evento.type() == evento.Type.Leave:
                 self.timer_botao.start()
-
+        try:
+            self.listar_linhas()
+        except:
+            pass
         return super().eventFilter(objeto, evento)
 
     def mostrar_texto(self, texto: str):
