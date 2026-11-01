@@ -67,6 +67,9 @@ SEM_IMAGEM = -1
 # O nome completo é "imagem://local/<id>".
 PREFIXO_IMAGEM = "imagem://local/"
 
+# Aparência da seleção múltipla.
+COR_SELECAO_MULTIPLA = QColor("#cfe2ff")
+COR_CURSOR_MULTIPLO = QColor("#202124")
 
 if CAMINHO_TESSERACT.exists():
     pytesseract.pytesseract.tesseract_cmd = str(
@@ -202,6 +205,16 @@ class EditorTexto(QTextEdit):
         self._proximo_id = 1
         self.id_selecionado = SEM_IMAGEM
 
+        # --- Seleção múltipla (Ctrl+D) ---
+        # Cursores secundários. O primário é sempre self.textCursor().
+        self._multi_ativo = False
+        self._cursores_extras = []
+        self._texto_alvo = ""
+        self._flags_busca = QTextDocument.FindFlag.FindCaseSensitively
+        # (início, fim) da palavra selecionada automaticamente no
+        # primeiro Ctrl+D, para decidir se a busca usa "palavra inteira".
+        self._selecao_automatica = None
+
         self.selectionChanged.connect(self._atualizar_selecao)
         self.cursorPositionChanged.connect(
             self._atualizar_selecao
@@ -304,6 +317,8 @@ class EditorTexto(QTextEdit):
 
     def inserir_imagem(self, imagem: QImage) -> int:
         """Insere a imagem em um parágrafo próprio e devolve o id."""
+        self.cancelar_multipla()
+        
         id_imagem = self._proximo_id
         self._proximo_id += 1
 
@@ -365,6 +380,8 @@ class EditorTexto(QTextEdit):
 
     def inserir_transcricao(self, id_imagem: int, texto: str):
         """Insere o texto logo abaixo da imagem com o id informado."""
+        self.cancelar_multipla()
+
         cursor = self.textCursor()
         cursor.beginEditBlock()
 
@@ -394,6 +411,7 @@ class EditorTexto(QTextEdit):
         self.setFocus()
 
     def limpar_conteudo(self):
+        self.cancelar_multipla()
         self.clear()
         self.imagens.clear()
         self._proximo_id = 1
@@ -413,6 +431,361 @@ class EditorTexto(QTextEdit):
             self.id_selecionado = novo_id
             self.imagem_selecionada.emit(novo_id)
 
+        # --------------------------------------------------------
+    # Seleção múltipla (Ctrl+D)
+    # --------------------------------------------------------
+
+    _TECLAS_MODIFICADORAS = (
+        Qt.Key.Key_Shift,
+        Qt.Key.Key_Control,
+        Qt.Key.Key_Alt,
+        Qt.Key.Key_AltGr,
+        Qt.Key.Key_Meta,
+        Qt.Key.Key_CapsLock,
+        Qt.Key.Key_NumLock,
+        Qt.Key.Key_ScrollLock,
+    )
+
+    def cancelar_multipla(self):
+        """Sai do modo múltiplo, mantendo apenas o cursor primário."""
+        if not self._multi_ativo and not self._cursores_extras:
+            return
+
+        self._multi_ativo = False
+        self._cursores_extras = []
+        self._texto_alvo = ""
+        self._selecao_automatica = None
+
+        self.setExtraSelections([])
+        self.viewport().update()
+
+    def _atualizar_destaques(self):
+        """Pinta as seleções secundárias (a primária é nativa)."""
+        formato = QTextCharFormat()
+        formato.setBackground(COR_SELECAO_MULTIPLA)
+
+        selecoes = []
+
+        for cursor in self._cursores_extras:
+            if not cursor.hasSelection():
+                continue
+
+            extra = QTextEdit.ExtraSelection()
+            extra.cursor = cursor
+            extra.format = formato
+            selecoes.append(extra)
+
+        self.setExtraSelections(selecoes)
+        self.viewport().update()
+
+    def _texto_das_selecoes(self):
+        """Textos de todas as seleções, em ordem de aparição."""
+        cursores = sorted(
+            [*self._cursores_extras, self.textCursor()],
+            key=lambda c: c.selectionStart(),
+        )
+
+        return "\n".join(
+            c.selectedText() for c in cursores if c.hasSelection()
+        )
+
+    def _fundir_duplicados(self):
+        """Remove cursores secundários idênticos entre si ou ao primário."""
+        primario = self.textCursor()
+        vistos = {(primario.anchor(), primario.position())}
+        unicos = []
+
+        for cursor in self._cursores_extras:
+            chave = (cursor.anchor(), cursor.position())
+
+            if chave in vistos:
+                continue
+
+            vistos.add(chave)
+            unicos.append(cursor)
+
+        self._cursores_extras = unicos
+
+        # Sobrou só o primário: volta ao modo convencional.
+        if not unicos:
+            self.cancelar_multipla()
+
+    def _buscar_proxima_ocorrencia(self, texto, posicao, ocupados):
+        """
+        Procura `texto` a partir de `posicao`, com retorno ao início
+        do documento. Ignora trechos que se sobrepõem a seleções
+        existentes (`ocupados`: lista de (início, fim)).
+        """
+        documento = self.document()
+
+        for inicio in (posicao, 0):
+            achado = documento.find(texto, inicio, self._flags_busca)
+
+            while not achado.isNull():
+                a = achado.selectionStart()
+                b = achado.selectionEnd()
+
+                if not any(a < fim and inicio_o < b
+                           for inicio_o, fim in ocupados):
+                    return achado
+
+                achado = documento.find(
+                    texto, achado, self._flags_busca
+                )
+
+        return None
+
+    def selecionar_proxima_ocorrencia(self):
+        """Ctrl+D: adiciona a próxima ocorrência do texto selecionado."""
+        cursor = self.textCursor()
+
+        # Sem seleção (e fora do modo): seleciona a palavra sob o cursor.
+        if not self._multi_ativo and not cursor.hasSelection():
+            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+            texto = cursor.selectedText()
+
+            if (
+                not texto.strip()
+                or "\ufffc" in texto
+                or "\u2029" in texto
+            ):
+                QApplication.beep()
+                return
+
+            self._selecao_automatica = (
+                cursor.selectionStart(),
+                cursor.selectionEnd(),
+            )
+            self.setTextCursor(cursor)
+            return
+
+        texto = cursor.selectedText()
+
+        # Nunca captura imagens (\ufffc) nem trechos multilinha
+        # (QTextDocument.find não casa separadores de parágrafo).
+        if (
+            not texto
+            or "\ufffc" in texto
+            or "\u2029" in texto
+        ):
+            QApplication.beep()
+            return
+
+        if not self._multi_ativo:
+            self._texto_alvo = texto
+            self._flags_busca = (
+                QTextDocument.FindFlag.FindCaseSensitively
+            )
+
+            # Palavra escolhida pelo primeiro Ctrl+D: só palavras inteiras.
+            if self._selecao_automatica == (
+                cursor.selectionStart(),
+                cursor.selectionEnd(),
+            ):
+                self._flags_busca |= (
+                    QTextDocument.FindFlag.FindWholeWords
+                )
+
+        ocupados = [
+            (c.selectionStart(), c.selectionEnd())
+            for c in (*self._cursores_extras, cursor)
+        ]
+
+        achado = self._buscar_proxima_ocorrencia(
+            self._texto_alvo,
+            cursor.selectionEnd(),
+            ocupados,
+        )
+
+        # Nada novo (única ocorrência ou todas já selecionadas).
+        if achado is None:
+            QApplication.beep()
+            return
+
+        # O antigo primário vira secundário; o achado vira primário.
+        self._cursores_extras.append(QTextCursor(cursor))
+        self._multi_ativo = True
+
+        self.setTextCursor(achado)
+        self.ensureCursorVisible()
+        self._atualizar_destaques()
+
+    def _executar_em_todos(self, operacao):
+        """
+        Aplica `operacao(cursor)` a todos os cursores, de trás para
+        frente, em um único bloco de edição (um único Ctrl+Z).
+        O QTextDocument reajusta os demais cursores a cada edição.
+        """
+        primario = QTextCursor(self.textCursor())
+        todos = [*self._cursores_extras, primario]
+
+        ordenados = sorted(
+            todos,
+            key=lambda c: c.selectionStart(),
+            reverse=True,
+        )
+
+        primario.beginEditBlock()
+
+        try:
+            for cursor in ordenados:
+                operacao(cursor)
+        finally:
+            primario.endEditBlock()
+
+        self._cursores_extras = [
+            c for c in todos if c is not primario
+        ]
+
+        self.setTextCursor(primario)
+        self._fundir_duplicados()
+        self._atualizar_destaques()
+        self.ensureCursorVisible()
+
+    def _apagaria_imagem(self, cursor, para_tras: bool) -> bool:
+        """
+        True se apagar um caractere (sem seleção) atingiria uma imagem,
+        ou juntaria o bloco atual a um bloco que contém imagem.
+        """
+        documento = self.document()
+        posicao = cursor.position()
+        alvo = posicao - 1 if para_tras else posicao
+
+        if alvo < 0 or alvo >= documento.characterCount() - 1:
+            return True
+
+        if documento.characterAt(alvo) == "\ufffc":
+            return True
+
+        if para_tras and cursor.atBlockStart():
+            vizinho = cursor.block().previous()
+        elif not para_tras and cursor.atBlockEnd():
+            vizinho = cursor.block().next()
+        else:
+            return False
+
+        return vizinho.isValid() and self.bloco_contem_imagem(vizinho)
+
+    def _apagar(self, cursor, para_tras: bool):
+        if cursor.hasSelection():
+            cursor.removeSelectedText()
+            return
+
+        if self._apagaria_imagem(cursor, para_tras):
+            return
+
+        if para_tras:
+            cursor.deletePreviousChar()
+        else:
+            cursor.deleteChar()
+
+    def _tratar_tecla_multipla(self, evento) -> bool:
+        """
+        Processa teclas da seleção múltipla.
+        Retorna True se o evento foi consumido.
+        """
+        chave = evento.key()
+        mods = evento.modifiers()
+
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        meta = bool(mods & Qt.KeyboardModifier.MetaModifier)
+
+        # Ctrl+D (funciona dentro e fora do modo múltiplo).
+        if (
+            mods == Qt.KeyboardModifier.ControlModifier
+            and chave == Qt.Key.Key_D
+        ):
+            self.selecionar_proxima_ocorrencia()
+            return True
+
+        if not self._multi_ativo:
+            return False
+
+        # Ctrl ou Alt isolados são atalhos; Ctrl+Alt é o AltGr do Windows.
+        atalho = (ctrl != alt) or meta
+
+        if chave in self._TECLAS_MODIFICADORAS:
+            return False
+
+        if chave == Qt.Key.Key_Escape:
+            self.cancelar_multipla()
+            return True
+
+        if evento.matches(QKeySequence.StandardKey.Copy):
+            texto = self._texto_das_selecoes()
+
+            if texto:
+                QApplication.clipboard().setText(texto)
+
+            return True
+
+        if evento.matches(QKeySequence.StandardKey.Cut):
+            texto = self._texto_das_selecoes()
+
+            if texto:
+                QApplication.clipboard().setText(texto)
+                self._executar_em_todos(
+                    lambda c: c.removeSelectedText()
+                )
+
+            return True
+
+        if not atalho:
+            if chave == Qt.Key.Key_Backspace:
+                self._executar_em_todos(
+                    lambda c: self._apagar(c, True)
+                )
+                return True
+
+            if chave == Qt.Key.Key_Delete:
+                self._executar_em_todos(
+                    lambda c: self._apagar(c, False)
+                )
+                return True
+
+            if chave in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._executar_em_todos(lambda c: c.insertBlock())
+                return True
+
+            texto = evento.text()
+
+            if texto and texto.isprintable():
+                self._executar_em_todos(
+                    lambda c: c.insertText(texto)
+                )
+                return True
+
+        # Qualquer outra tecla (setas, Home/End, Ctrl+Z, Ctrl+A, Tab...)
+        # encerra o modo e segue o fluxo normal do editor.
+        self.cancelar_multipla()
+        return False
+
+    def paintEvent(self, evento):
+        super().paintEvent(evento)
+
+        if not self._multi_ativo:
+            return
+
+        # Desenha o caret das seleções secundárias já vazias.
+        pintor = QPainter(self.viewport())
+
+        for cursor in self._cursores_extras:
+            if cursor.hasSelection():
+                continue
+
+            retangulo = self.cursorRect(cursor)
+
+            pintor.fillRect(
+                retangulo.x(),
+                retangulo.y(),
+                max(self.cursorWidth(), 1),
+                retangulo.height(),
+                COR_CURSOR_MULTIPLO,
+            )
+
+        pintor.end()
+        
     def imagem_na_posicao(self, ponto: QPoint):
         """
         Retorna (posição, id) se o ponto (coordenadas do viewport)
@@ -459,6 +832,9 @@ class EditorTexto(QTextEdit):
         return None
 
     def mousePressEvent(self, evento):
+        # Qualquer clique encerra a seleção múltipla.
+        self.cancelar_multipla()
+
         if evento.button() == Qt.MouseButton.LeftButton:
             achado = self.imagem_na_posicao(
                 evento.position().toPoint()
@@ -548,6 +924,11 @@ class EditorTexto(QTextEdit):
         return True
 
     def keyPressEvent(self, evento):
+        # Seleção múltipla tem prioridade; fora do modo, o fluxo
+        # abaixo permanece exatamente como era.
+        if self._tratar_tecla_multipla(evento):
+            return
+
         modificadores = evento.modifiers()
         texto = evento.text()
 
@@ -597,6 +978,21 @@ class EditorTexto(QTextEdit):
         )
 
     def insertFromMimeData(self, source: QMimeData):
+        # Modo múltiplo: texto vai para todos os cursores.
+        # Imagem encerra o modo e segue o fluxo normal.
+        if self._multi_ativo:
+            if source.hasText() and not source.hasImage():
+                texto = source.text()
+
+                if texto:
+                    self._executar_em_todos(
+                        lambda c: c.insertText(texto)
+                    )
+
+                return
+
+            self.cancelar_multipla()
+
         if source.hasImage():
             dado = source.imageData()
             imagem = None
@@ -618,6 +1014,15 @@ class EditorTexto(QTextEdit):
         super().insertFromMimeData(source)
 
     def createMimeDataFromSelection(self):
+        # Modo múltiplo: copia os textos de todas as seleções.
+        if self._multi_ativo:
+            texto = self._texto_das_selecoes()
+
+            if texto:
+                mime = QMimeData()
+                mime.setText(texto)
+                return mime
+
         # Copiar/recortar uma imagem selecionada coloca a própria
         # imagem na área de transferência. Ao colar, ela vira uma
         # nova imagem, com um novo id.
