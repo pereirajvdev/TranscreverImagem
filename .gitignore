@@ -1,0 +1,61 @@
+# ==========================================
+# AMBIENTE PYTHON
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================================
+# CACHE E TESTES
+# ==========================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# IDEs E EDITORES
+# ==========================================
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# ==========================================
+# WINDOWS
+# ==========================================
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ==========================================
+# ARQUIVOS TEMPORÁRIOS
+# ==========================================
+*.tmp
+*.temp
+*.bak
+*.log
+temp/
+tmp/
+temporario/
+
+# ==========================================
+# CONFIGURAÇÕES LOCAIS E SEGREDOS
+# ==========================================
+.env
+.env.*
+!.env.example
+secrets.json
+credentials.json
+
+# ==========================================
+# RESULTADOS DE PROCESSAMENTO
+# ==========================================
+output/
+outputs/
+resultados/
