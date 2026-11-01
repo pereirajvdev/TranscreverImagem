@@ -731,6 +731,12 @@ class EditorTexto(QTextEdit):
 
             return True
 
+        if evento.matches(QKeySequence.StandardKey.Paste):
+            self.insertFromMimeData(
+                QApplication.clipboard().mimeData()
+            )
+            return True
+        
         if not atalho:
             if chave == Qt.Key.Key_Backspace:
                 self._executar_em_todos(
@@ -967,17 +973,67 @@ class EditorTexto(QTextEdit):
                 return
 
         super().keyPressEvent(evento)
-
+    
     # --------------------------------------------------------
     # Área de transferência
     # --------------------------------------------------------
 
+        # --------------------------------------------------------
+    # Planilhas (Excel, Calc, Google Sheets...)
+    # --------------------------------------------------------
+
+    _MARCAS_FORMATO_PLANILHA = ("biff", "xml spreadsheet", "csv")
+    _MARCAS_HTML_PLANILHA = (
+        "<table",
+        "urn:schemas-microsoft-com:office:excel",
+        "excel.sheet",
+    )
+
+    @classmethod
+    def _e_planilha(cls, source: QMimeData) -> bool:
+        """True se o conteúdo veio de células de uma planilha."""
+        if not source.hasText():
+            return False
+
+        formatos = " ".join(source.formats()).lower()
+
+        if any(m in formatos for m in cls._MARCAS_FORMATO_PLANILHA):
+            return True
+
+        if source.hasHtml():
+            html = source.html().lower()
+            return any(m in html for m in cls._MARCAS_HTML_PLANILHA)
+
+        return False
+
+    @staticmethod
+    def _mime_texto_puro(source: QMimeData) -> QMimeData:
+        """
+        Novo QMimeData só com o text/plain (colunas em \\t, linhas
+        em \\n), descartando HTML, imagem e formatos proprietários.
+        """
+        texto = (
+            source.text()
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
+
+        mime = QMimeData()
+        mime.setText(texto)
+        return mime
+    
     def canInsertFromMimeData(self, source: QMimeData):
         return source.hasImage() or super().canInsertFromMimeData(
             source
         )
 
     def insertFromMimeData(self, source: QMimeData):
+        # Células de planilha: o Excel publica também uma IMAGEM e um
+        # HTML da tabela. Ficamos só com o texto puro (\t e \n), e o
+        # restante do método passa a enxergar apenas texto.
+        if self._e_planilha(source):
+            source = self._mime_texto_puro(source)
+
         # Modo múltiplo: texto vai para todos os cursores.
         # Imagem encerra o modo e segue o fluxo normal.
         if self._multi_ativo:
