@@ -210,7 +210,7 @@ class EditorTexto(QTextEdit):
         self._multi_ativo = False
         self._cursores_extras = []
         self._texto_alvo = ""
-        self._flags_busca = QTextDocument.FindFlag.FindCaseSensitively
+        self._palavra_inteira = False
         # (início, fim) da palavra selecionada automaticamente no
         # primeiro Ctrl+D, para decidir se a busca usa "palavra inteira".
         self._selecao_automatica = None
@@ -486,7 +486,9 @@ class EditorTexto(QTextEdit):
         )
 
         return "\n".join(
-            c.selectedText() for c in cursores if c.hasSelection()
+            self._normalizar_busca(c.selectedText())
+            for c in cursores
+            if c.hasSelection()
         )
 
     def _fundir_duplicados(self):
@@ -510,28 +512,81 @@ class EditorTexto(QTextEdit):
         if not unicos:
             self.cancelar_multipla()
 
+    @staticmethod
+    def _normalizar_busca(texto: str) -> str:
+        """Representa o texto como toPlainText() o representa."""
+        return (
+            texto
+            .replace("\u2029", "\n")
+            .replace("\u2028", "\n")
+            .replace("\u00a0", " ")
+        )
+
+    @staticmethod
+    def _e_caractere_de_palavra(c: str) -> bool:
+        return c.isalnum() or c == "_"
+
+    def _ocorrencia_toca_imagem(self, inicio: int, fim: int) -> bool:
+        """True se o trecho (com \\n) atravessa um bloco com imagem."""
+        documento = self.document()
+        bloco = documento.findBlock(inicio)
+        ultimo = documento.findBlock(fim)
+
+        while bloco.isValid():
+            if self.bloco_contem_imagem(bloco):
+                return True
+
+            if bloco == ultimo:
+                break
+
+            bloco = bloco.next()
+
+        return False
+
     def _buscar_proxima_ocorrencia(self, texto, posicao, ocupados):
         """
-        Procura `texto` a partir de `posicao`, com retorno ao início
-        do documento. Ignora trechos que se sobrepõem a seleções
-        existentes (`ocupados`: lista de (início, fim)).
+        Procura `texto` (pode conter \\n) a partir de `posicao`, com
+        retorno ao início. Ignora trechos sobrepostos a seleções
+        existentes (`ocupados`: lista de (início, fim)) e trechos
+        multilinha que tocam parágrafos com imagem.
+        Retorna um QTextCursor com a ocorrência, ou None.
         """
-        documento = self.document()
+        conteudo = self.document().toPlainText()
+        multilinha = "\n" in texto
+        tamanho = len(texto)
 
-        for inicio in (posicao, 0):
-            achado = documento.find(texto, inicio, self._flags_busca)
+        for inicio_busca in (posicao, 0):
+            i = conteudo.find(texto, inicio_busca)
 
-            while not achado.isNull():
-                a = achado.selectionStart()
-                b = achado.selectionEnd()
+            while i != -1:
+                a, b = i, i + tamanho
 
-                if not any(a < fim and inicio_o < b
-                           for inicio_o, fim in ocupados):
-                    return achado
-
-                achado = documento.find(
-                    texto, achado, self._flags_busca
+                valido = not any(
+                    a < fim and inicio < b
+                    for inicio, fim in ocupados
                 )
+
+                if valido and self._palavra_inteira:
+                    antes = a > 0 and self._e_caractere_de_palavra(
+                        conteudo[a - 1]
+                    )
+                    depois = b < len(conteudo) and (
+                        self._e_caractere_de_palavra(conteudo[b])
+                    )
+                    valido = not antes and not depois
+
+                if valido and multilinha:
+                    valido = not self._ocorrencia_toca_imagem(a, b)
+
+                if valido:
+                    cursor = QTextCursor(self.document())
+                    cursor.setPosition(a)
+                    cursor.setPosition(
+                        b, QTextCursor.MoveMode.KeepAnchor
+                    )
+                    return cursor
+
+                i = conteudo.find(texto, i + 1)
 
         return None
 
@@ -561,30 +616,21 @@ class EditorTexto(QTextEdit):
 
         texto = cursor.selectedText()
 
-        # Nunca captura imagens (\ufffc) nem trechos multilinha
-        # (QTextDocument.find não casa separadores de parágrafo).
-        if (
-            not texto
-            or "\ufffc" in texto
-            or "\u2029" in texto
-        ):
+        # Nunca captura imagens (\ufffc). Quebras de linha são aceitas.
+        if not texto or "\ufffc" in texto:
             QApplication.beep()
             return
 
         if not self._multi_ativo:
-            self._texto_alvo = texto
-            self._flags_busca = (
-                QTextDocument.FindFlag.FindCaseSensitively
-            )
+            self._texto_alvo = self._normalizar_busca(texto)
 
             # Palavra escolhida pelo primeiro Ctrl+D: só palavras inteiras.
-            if self._selecao_automatica == (
-                cursor.selectionStart(),
-                cursor.selectionEnd(),
-            ):
-                self._flags_busca |= (
-                    QTextDocument.FindFlag.FindWholeWords
+            self._palavra_inteira = (
+                self._selecao_automatica == (
+                    cursor.selectionStart(),
+                    cursor.selectionEnd(),
                 )
+            )
 
         ocupados = [
             (c.selectionStart(), c.selectionEnd())
