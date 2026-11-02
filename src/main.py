@@ -20,6 +20,8 @@ from PySide6.QtCore import (
     QPointF,
     QRectF,
     QUrl,
+    QSize,
+    QTimer,
 )
 from PySide6.QtGui import (
     QColor,
@@ -33,6 +35,8 @@ from PySide6.QtGui import (
     QTextCursor,
     QTextDocument,
     QTextImageFormat,
+    QFont,
+    QGuiApplication,    
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,13 +46,19 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QTextEdit,
     QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
+from icones import criar_icone, criar_icone_carregando
+from temas import (
+    GerenciadorTemas,
+    gerar_qss,
+    montar_palette,
+    repolir,
+)
 
 # ============================================================
 # CONFIGURAÇÕES
@@ -66,10 +76,6 @@ SEM_IMAGEM = -1
 # Prefixo do "nome" de cada imagem dentro do documento.
 # O nome completo é "imagem://local/<id>".
 PREFIXO_IMAGEM = "imagem://local/"
-
-# Aparência da seleção múltipla.
-COR_SELECAO_MULTIPLA = QColor("#cfe2ff")
-COR_CURSOR_MULTIPLO = QColor("#202124")
 
 if CAMINHO_TESSERACT.exists():
     pytesseract.pytesseract.tesseract_cmd = str(
@@ -214,6 +220,10 @@ class EditorTexto(QTextEdit):
         # (início, fim) da palavra selecionada automaticamente no
         # primeiro Ctrl+D, para decidir se a busca usa "palavra inteira".
         self._selecao_automatica = None
+
+        # Cores da seleção múltipla (definidas pelo tema da nota).
+        self._cor_selecao_multipla = QColor(Qt.GlobalColor.lightGray)
+        self._cor_cursor_multiplo = QColor(Qt.GlobalColor.black)
 
         self.selectionChanged.connect(self._atualizar_selecao)
         self.cursorPositionChanged.connect(
@@ -459,10 +469,20 @@ class EditorTexto(QTextEdit):
         self.setExtraSelections([])
         self.viewport().update()
 
+    def aplicar_cores_multiplas(self, selecao: QColor, cursor: QColor):
+        """Cores das seleções secundárias e dos carets extras."""
+        self._cor_selecao_multipla = QColor(selecao)
+        self._cor_cursor_multiplo = QColor(cursor)
+
+        if self._multi_ativo:
+            self._atualizar_destaques()
+        else:
+            self.viewport().update()
+
     def _atualizar_destaques(self):
         """Pinta as seleções secundárias (a primária é nativa)."""
         formato = QTextCharFormat()
-        formato.setBackground(COR_SELECAO_MULTIPLA)
+        formato.setBackground(self._cor_selecao_multipla)
 
         selecoes = []
 
@@ -833,7 +853,7 @@ class EditorTexto(QTextEdit):
                 retangulo.y(),
                 max(self.cursorWidth(), 1),
                 retangulo.height(),
-                COR_CURSOR_MULTIPLO,
+                self._cor_cursor_multiplo,
             )
 
         pintor.end()
@@ -1151,6 +1171,8 @@ class EditorTranscricao(QWidget):
 
         self.setObjectName("editorTranscricao")
 
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
         self.criar_interface()
 
     @property
@@ -1168,6 +1190,7 @@ class EditorTranscricao(QWidget):
         self.editor_texto.setPlaceholderText(
             "Cole imagens ou digite seu texto..."
         )
+        self.editor_texto.document().setDocumentMargin(14)
 
         self.editor_texto.imagem_inserida.connect(
             self.imagem_inserida.emit
@@ -1206,7 +1229,16 @@ class NotaWidget(QWidget):
         self.transcritor = None
         self.em_transcricao = False
 
+        self._paleta = janela_principal.temas.paleta
+        self._icone_transcrever = None
+        self._angulo_spinner = 0
+
+        self._timer_spinner = QTimer(self)
+        self._timer_spinner.setInterval(60)
+        self._timer_spinner.timeout.connect(self._girar_spinner)
+
         self.setObjectName("notaWidget")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self.criar_interface()
 
@@ -1215,20 +1247,33 @@ class NotaWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Cabeçalho compacto
-        cabecalho = QHBoxLayout()
-        cabecalho.setContentsMargins(4, 0, 2, 0)
-        cabecalho.setSpacing(2)
+        # Cabeçalho da nota
+        self.cabecalho_nota = QWidget(self)
+        self.cabecalho_nota.setObjectName("cabecalhoNota")
+        self.cabecalho_nota.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground, True
+        )
+        self.cabecalho_nota.setProperty("ativa", False)
+
+        cabecalho = QHBoxLayout(self.cabecalho_nota)
+        cabecalho.setContentsMargins(12, 6, 8, 6)
+        cabecalho.setSpacing(6)
 
         self.titulo = QLabel(f"Nota {self.numero}")
         self.titulo.setObjectName("tituloNota")
+        self.titulo.setProperty("ativa", False)
 
-        self.botao_fechar = QPushButton("×")
+        self.botao_fechar = QPushButton()
         self.botao_fechar.setObjectName("botaoFecharNota")
-        self.botao_fechar.setFixedSize(24, 24)
+        self.botao_fechar.setProperty("papel", "fechar")
+        self.botao_fechar.setFixedSize(26, 26)
+        self.botao_fechar.setIconSize(QSize(14, 14))
         self.botao_fechar.setToolTip("Fechar nota")
         self.botao_fechar.setCursor(
             Qt.CursorShape.PointingHandCursor
+        )
+        self.botao_fechar.setFocusPolicy(
+            Qt.FocusPolicy.TabFocus
         )
         self.botao_fechar.clicked.connect(
             self.fechar_nota
@@ -1238,23 +1283,32 @@ class NotaWidget(QWidget):
         cabecalho.addStretch()
         cabecalho.addWidget(self.botao_fechar)
 
-        layout.addLayout(cabecalho)
+        layout.addWidget(self.cabecalho_nota)
 
         # Editor: ocupa todo o espaço vertical disponível
         self.editor = EditorTranscricao(self)
         layout.addWidget(self.editor, stretch=1)
 
-        # Controles inferiores compactos
-        layout_botoes = QHBoxLayout()
-        layout_botoes.setContentsMargins(2, 2, 2, 2)
-        layout_botoes.setSpacing(3)
+        # Barra de ações (só aparece quando há algum botão visível)
+        self.barra_acoes = QWidget(self)
+        self.barra_acoes.setObjectName("barraAcoes")
+        self.barra_acoes.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground, True
+        )
+
+        layout_botoes = QHBoxLayout(self.barra_acoes)
+        layout_botoes.setContentsMargins(10, 8, 10, 8)
+        layout_botoes.setSpacing(8)
 
         self.botao_transcrever = QPushButton("Transcrever")
-        self.botao_transcrever.setObjectName(
-            "botaoTranscrever"
-        )
+        self.botao_transcrever.setObjectName("botaoTranscrever")
+        self.botao_transcrever.setProperty("papel", "primario")
+        self.botao_transcrever.setIconSize(QSize(16, 16))
         self.botao_transcrever.setCursor(
             Qt.CursorShape.PointingHandCursor
+        )
+        self.botao_transcrever.setFocusPolicy(
+            Qt.FocusPolicy.TabFocus
         )
         self.botao_transcrever.hide()
         self.botao_transcrever.clicked.connect(
@@ -1262,6 +1316,14 @@ class NotaWidget(QWidget):
         )
 
         self.botao_copiar = QPushButton("Copiar texto")
+        self.botao_copiar.setObjectName("botaoCopiar")
+        self.botao_copiar.setIconSize(QSize(16, 16))
+        self.botao_copiar.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.botao_copiar.setFocusPolicy(
+            Qt.FocusPolicy.TabFocus
+        )
         self.botao_copiar.hide()
         self.botao_copiar.clicked.connect(
             self.copiar_texto
@@ -1271,7 +1333,7 @@ class NotaWidget(QWidget):
         layout_botoes.addStretch()
         layout_botoes.addWidget(self.botao_copiar)
 
-        layout.addLayout(layout_botoes)
+        layout.addWidget(self.barra_acoes)
 
         # Eventos do editor
         self.editor.imagem_selecionada.connect(
@@ -1289,6 +1351,9 @@ class NotaWidget(QWidget):
             )
         )
 
+        self.aplicar_tema(self._paleta)
+        self._atualizar_barra_acoes()
+
 
     def _criar_focus_handler(self, handler_original):
         def handler(evento):
@@ -1297,25 +1362,86 @@ class NotaWidget(QWidget):
 
         return handler
 
+    def aplicar_tema(self, paleta):
+        """Atualiza ícones e cores do editor. Não toca no conteúdo."""
+        self._paleta = paleta
+
+        self.botao_fechar.setIcon(
+            criar_icone("fechar", paleta.texto_suave)
+        )
+        self.botao_copiar.setIcon(
+            criar_icone(
+                "copiar",
+                paleta.texto,
+                cor_desativada=paleta.texto_desativado,
+            )
+        )
+
+        self._icone_transcrever = criar_icone(
+            "transcrever", paleta.texto_sobre_destaque
+        )
+
+        if not self.em_transcricao:
+            self.botao_transcrever.setIcon(self._icone_transcrever)
+
+        self.editor.editor_texto.aplicar_cores_multiplas(
+            QColor(paleta.selecao_secundaria),
+            QColor(paleta.cursor_secundario),
+        )
+
+    def definir_ativa(self, ativa: bool):
+        """Destaca o cabeçalho da nota que está em uso."""
+        if bool(self.cabecalho_nota.property("ativa")) == ativa:
+            return
+
+        for widget in (self.cabecalho_nota, self.titulo):
+            widget.setProperty("ativa", ativa)
+            repolir(widget)
+
+    def _atualizar_barra_acoes(self):
+        visivel = (
+            self.botao_transcrever.isVisibleTo(self.barra_acoes)
+            or self.botao_copiar.isVisibleTo(self.barra_acoes)
+        )
+        self.barra_acoes.setVisible(visivel)
+
+    def _iniciar_spinner(self):
+        self._angulo_spinner = 0
+        self._girar_spinner()
+        self._timer_spinner.start()
+
+    def _parar_spinner(self):
+        self._timer_spinner.stop()
+
+    def _girar_spinner(self):
+        self._angulo_spinner = (self._angulo_spinner + 30) % 360
+
+        self.botao_transcrever.setIcon(
+            criar_icone_carregando(
+                self._paleta.texto_sobre_destaque,
+                self._angulo_spinner,
+                tamanho=16,
+            )
+        )
+
     def atualizar_botao_transcrever(self, id_imagem):
         if id_imagem == SEM_IMAGEM:
             self.botao_transcrever.hide()
+            self._atualizar_barra_acoes()
             return
 
-        self.botao_transcrever.setText(
-            f"Transcrever imagem #{id_imagem}"
-        )
-
-        self.botao_transcrever.setEnabled(
-            not self.em_transcricao
-        )
-
         if self.em_transcricao:
+            self.botao_transcrever.setText("Transcrevendo...")
+            self.botao_transcrever.setEnabled(False)
+        else:
             self.botao_transcrever.setText(
-                "Transcrevendo..."
+                f"Transcrever imagem #{id_imagem}"
             )
+            self.botao_transcrever.setIcon(self._icone_transcrever)
+            self.botao_transcrever.setEnabled(True)
 
         self.botao_transcrever.show()
+        self._atualizar_barra_acoes()
 
     def atualizar_botao_copiar(self):
         texto = (
@@ -1327,6 +1453,7 @@ class NotaWidget(QWidget):
         self.botao_copiar.setVisible(
             bool(texto.strip())
         )
+        self._atualizar_barra_acoes()
 
     def transcrever_imagem(self):
         if self.em_transcricao:
@@ -1344,6 +1471,8 @@ class NotaWidget(QWidget):
 
         self.em_transcricao = True
         self.atualizar_botao_transcrever(id_imagem)
+
+        self._iniciar_spinner()
 
         self.janela_principal.statusBar().showMessage(
             f"Transcrevendo imagem #{id_imagem} "
@@ -1392,6 +1521,7 @@ class NotaWidget(QWidget):
 
     def finalizar_transcricao(self):
         self.em_transcricao = False
+        self._parar_spinner()
 
         self.atualizar_botao_transcrever(
             self.editor.id_selecionado
@@ -1513,8 +1643,11 @@ class JanelaPrincipal(QMainWindow):
         super().__init__()
 
         self.notas = []
-        self.nota_ativa = None
+        self._nota_ativa = None
         self.proximo_numero_nota = 1
+
+        self.temas = GerenciadorTemas(self)
+        self.temas.tema_alterado.connect(self.aplicar_tema)
 
         self.setWindowTitle(TITULO_JANELA)
         self.resize(1200, 750)
@@ -1522,13 +1655,24 @@ class JanelaPrincipal(QMainWindow):
 
         self.criar_interface()
         self.configurar_atalhos()
-        self.aplicar_estilo()
+        self.aplicar_tema()
 
         self.adicionar_nota()
 
         self.statusBar().showMessage(
             "Pronto para transcrever."
         )
+
+    @property
+    def nota_ativa(self):
+        return self._nota_ativa
+
+    @nota_ativa.setter
+    def nota_ativa(self, nota):
+        self._nota_ativa = nota
+
+        for outra in self.notas:
+            outra.definir_ativa(outra is nota)
 
     def criar_interface(self):
         central = QWidget(self)
@@ -1539,41 +1683,75 @@ class JanelaPrincipal(QMainWindow):
         layout_principal.setSpacing(0)
 
         # Cabeçalho
-        cabecalho = QHBoxLayout()
-        cabecalho.setContentsMargins(6, 4, 6, 4)
-        cabecalho.setSpacing(4)
+        self.cabecalho = QWidget(central)
+        self.cabecalho.setObjectName("cabecalhoPrincipal")
+        self.cabecalho.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground, True
+        )
+
+        cabecalho = QHBoxLayout(self.cabecalho)
+        cabecalho.setContentsMargins(14, 10, 14, 10)
+        cabecalho.setSpacing(10)
+
+        self.logo = QLabel()
+        self.logo.setFixedSize(28, 28)
 
         self.titulo = QLabel("Transcrever imagem")
         self.titulo.setObjectName("titulo")
 
-        self.botao_adicionar = QPushButton("+")
-        self.botao_adicionar.setObjectName(
-            "botaoAdicionarNota"
+        self.botao_tema = QPushButton()
+        self.botao_tema.setObjectName("botaoTema")
+        self.botao_tema.setProperty("papel", "icone")
+        self.botao_tema.setFixedSize(36, 36)
+        self.botao_tema.setIconSize(QSize(20, 20))
+        self.botao_tema.setCursor(
+            Qt.CursorShape.PointingHandCursor
         )
-        self.botao_adicionar.setFixedSize(40, 40)
+        self.botao_tema.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.botao_tema.clicked.connect(self.alternar_tema)
+
+        self.botao_adicionar = QPushButton()
+        self.botao_adicionar.setObjectName("botaoAdicionarNota")
+        self.botao_adicionar.setProperty("papel", "primario-icone")
+        self.botao_adicionar.setFixedSize(36, 36)
+        self.botao_adicionar.setIconSize(QSize(18, 18))
         self.botao_adicionar.setToolTip("Adicionar nova nota")
         self.botao_adicionar.setCursor(
             Qt.CursorShape.PointingHandCursor
+        )
+        self.botao_adicionar.setFocusPolicy(
+            Qt.FocusPolicy.TabFocus
         )
         self.botao_adicionar.clicked.connect(
             self.adicionar_nota
         )
 
+        cabecalho.addWidget(self.logo)
         cabecalho.addWidget(self.titulo)
         cabecalho.addStretch()
+        cabecalho.addWidget(self.botao_tema)
         cabecalho.addWidget(self.botao_adicionar)
 
-        layout_principal.addLayout(cabecalho)
+        layout_principal.addWidget(self.cabecalho)
 
-        # Área horizontal das notas
-        self.layout_notas = QHBoxLayout()
+        # Área horizontal das notas: o fundo é a cor da borda e o
+        # espaçamento de 1 px vira o divisor entre os painéis.
+        self.area_notas = QWidget(central)
+        self.area_notas.setObjectName("areaNotas")
+        self.area_notas.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground, True
+        )
+
+        self.layout_notas = QHBoxLayout(self.area_notas)
         self.layout_notas.setContentsMargins(0, 0, 0, 0)
-        self.layout_notas.setSpacing(0)
+        self.layout_notas.setSpacing(1)
 
-        layout_principal.addLayout(
-            self.layout_notas,
+        layout_principal.addWidget(
+            self.area_notas,
             stretch=1,
         )
+
+        self.statusBar().setSizeGripEnabled(False)
 
     def adicionar_nota(self):
         nota = NotaWidget(
@@ -1637,104 +1815,52 @@ class JanelaPrincipal(QMainWindow):
             self.copiar_texto
         )
 
-    def aplicar_estilo(self):
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #f5f6f8;
-            }
+        self.atalho_tema = QShortcut(
+            QKeySequence("Ctrl+Shift+T"),
+            self,
+        )
+        self.atalho_tema.activated.connect(self.alternar_tema)
 
-            QLabel#titulo {
-                color: #202124;
-                font-size: 22px;
-                font-weight: bold;
-                padding-bottom: 4px;
-            }
+    def alternar_tema(self):
+        self.temas.alternar()
 
-            QLabel#tituloNota {
-                color: #30343b;
-                font-size: 14px;
-                font-weight: bold;
-            }
+    def aplicar_tema(self, *_):
+        paleta = self.temas.paleta
+        escuro = self.temas.escuro
+        app = QApplication.instance()
 
-            QWidget#notaWidget {
-                background-color: #ffffff;
-                border: none;
-                border-radius: 0;
-            }
+        # Opcional (PySide6 >= 6.8): faz a barra de título do Windows
+        # acompanhar o tema.
+        dicas = QGuiApplication.styleHints()
 
-            QWidget#editorTranscricao {
-                background-color: #ffffff;
-                border: none;
-                border-radius: 0;
-            }
+        if hasattr(dicas, "setColorScheme"):
+            dicas.setColorScheme(
+                Qt.ColorScheme.Dark if escuro
+                else Qt.ColorScheme.Light
+            )
 
-            QTextEdit#editorTexto {
-                background-color: #ffffff;
-                color: #202124;
-                border: none;
-                border-radius: 0;
-                padding: 4px;
-                font-size: 14px;
-                selection-background-color: #cfe2ff;
-            }
+        app.setPalette(montar_palette(paleta))
+        app.setStyleSheet(gerar_qss(paleta))
 
-            QPushButton {
-                background-color: #e8eaed;
-                color: #202124;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 13px;
-            }
+        self.logo.setPixmap(
+            criar_icone("logo", paleta.destaque).pixmap(28, 28)
+        )
+        self.botao_tema.setIcon(
+            criar_icone(
+                "sol" if escuro else "lua",
+                paleta.texto_suave,
+            )
+        )
+        self.botao_tema.setToolTip(
+            "Mudar para o tema claro" if escuro
+            else "Mudar para o tema escuro"
+        )
+        self.botao_adicionar.setIcon(
+            criar_icone("mais", paleta.texto_sobre_destaque)
+        )
 
-            QPushButton:hover {
-                background-color: #d9dde3;
-            }
-
-            QPushButton:disabled {
-                background-color: #e8eaed;
-                color: #777777;
-            }
-
-            QPushButton#botaoTranscrever {
-                background-color: #1769e0;
-                color: white;
-                font-weight: bold;
-            }
-
-            QPushButton#botaoTranscrever:hover {
-                background-color: #0f57bd;
-            }
-
-            QPushButton#botaoTranscrever:disabled {
-                background-color: #7da9e8;
-                color: white;
-            }
-
-            QPushButton#botaoAdicionarNota {
-                background-color: #1769e0;
-                color: white;
-                font-size: 24px;
-                font-weight: bold;
-                padding: 0;
-            }
-
-            QPushButton#botaoAdicionarNota:hover {
-                background-color: #0f57bd;
-            }
-
-            QPushButton#botaoFecharNota {
-                background-color: transparent;
-                color: #70757a;
-                font-size: 22px;
-                padding: 0;
-            }
-
-            QPushButton#botaoFecharNota:hover {
-                background-color: #dadde2;
-                color: #202124;
-            }
-        """)
+        for nota in self.notas:
+            nota.aplicar_tema(paleta)
 
     def abrir_imagens(self):
         nota = self.nota_ativa
@@ -1791,6 +1917,8 @@ class JanelaPrincipal(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(TITULO_JANELA)
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 10))
 
     janela = JanelaPrincipal()
     janela.show()
