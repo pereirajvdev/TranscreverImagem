@@ -34,9 +34,11 @@ from PySide6.QtGui import (
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
+    QTextFormat,
     QTextImageFormat,
     QFont,
-    QGuiApplication,    
+    QFontInfo,
+    QGuiApplication,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -77,6 +79,14 @@ SEM_IMAGEM = -1
 # O nome completo é "imagem://local/<id>".
 PREFIXO_IMAGEM = "imagem://local/"
 
+# Zoom do editor (Ctrl + Scroll), em pontos.
+ZOOM_MINIMO = 6.0
+ZOOM_MAXIMO = 48.0
+ZOOM_PASSO = 1.0
+
+# Um "clique" da roda do mouse equivale a 120 unidades.
+UNIDADES_POR_CLIQUE_RODA = 120
+
 if CAMINHO_TESSERACT.exists():
     pytesseract.pytesseract.tesseract_cmd = str(
         CAMINHO_TESSERACT
@@ -99,7 +109,6 @@ class TranscritorOCR(QThread):
         self.id_imagem = id_imagem
         self.imagem = imagem.copy()
 
-    
     def run(self):
         try:
 
@@ -120,7 +129,6 @@ class TranscritorOCR(QThread):
 
             dados = bytes(buffer.data())
             buffer.close()
-
 
             with Image.open(BytesIO(dados)) as original:
                 imagem = original.convert("RGB")
@@ -190,7 +198,6 @@ class TranscritorOCR(QThread):
             )
 
 
-
 # ============================================================
 # EDITOR DE IMAGENS E TEXTO
 # ============================================================
@@ -224,6 +231,11 @@ class EditorTexto(QTextEdit):
         # Cores da seleção múltipla (definidas pelo tema da nota).
         self._cor_selecao_multipla = QColor(Qt.GlobalColor.lightGray)
         self._cor_cursor_multiplo = QColor(Qt.GlobalColor.black)
+
+        # --- Zoom (Ctrl + Scroll), individual por editor ---
+        # None = nenhum zoom aplicado ainda (vale a fonte do tema).
+        self._zoom_pt = None
+        self._acumulado_roda = 0
 
         self.selectionChanged.connect(self._atualizar_selecao)
         self.cursorPositionChanged.connect(
@@ -328,7 +340,7 @@ class EditorTexto(QTextEdit):
     def inserir_imagem(self, imagem: QImage) -> int:
         """Insere a imagem em um parágrafo próprio e devolve o id."""
         self.cancelar_multipla()
-        
+
         id_imagem = self._proximo_id
         self._proximo_id += 1
 
@@ -441,7 +453,63 @@ class EditorTexto(QTextEdit):
             self.id_selecionado = novo_id
             self.imagem_selecionada.emit(novo_id)
 
-        # --------------------------------------------------------
+    # --------------------------------------------------------
+    # Texto puro e área de transferência
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _normalizar_busca(texto: str) -> str:
+        """Representa o texto como toPlainText() o representa."""
+        return (
+            texto
+            .replace("\u2029", "\n")
+            .replace("\u2028", "\n")
+            .replace("\u00a0", " ")
+        )
+
+    @classmethod
+    def _para_texto_puro(cls, texto: str) -> str:
+        """Texto como o usuário o vê: sem marcadores de imagem."""
+        return cls._normalizar_busca(texto).replace("\ufffc", "")
+
+    @staticmethod
+    def _mime_somente_texto(texto: str) -> QMimeData:
+        """QMimeData que carrega apenas text/plain."""
+        mime = QMimeData()
+        mime.setText(texto)
+        return mime
+
+    @classmethod
+    def definir_area_de_transferencia(cls, texto: str):
+        """Coloca SOMENTE texto puro na área de transferência."""
+        QGuiApplication.clipboard().setMimeData(
+            cls._mime_somente_texto(texto)
+        )
+
+    def _texto_puro_do_cursor(self, cursor: QTextCursor) -> str:
+        return self._para_texto_puro(cursor.selectedText())
+
+    def texto_para_copiar(self) -> str:
+        """
+        Texto puro para "Copiar texto": todas as seleções (modo
+        múltiplo), a seleção atual ou, sem seleção, a nota inteira.
+        """
+        if self._multi_ativo:
+            texto = self._texto_das_selecoes()
+
+            if texto:
+                return texto
+
+        cursor = self.textCursor()
+
+        if cursor.hasSelection():
+            return self._texto_puro_do_cursor(cursor)
+
+        return self._para_texto_puro(
+            self.document().toPlainText()
+        ).strip("\n")
+
+    # --------------------------------------------------------
     # Seleção múltipla (Ctrl+D)
     # --------------------------------------------------------
 
@@ -454,6 +522,15 @@ class EditorTexto(QTextEdit):
         Qt.Key.Key_CapsLock,
         Qt.Key.Key_NumLock,
         Qt.Key.Key_ScrollLock,
+    )
+
+    _TECLAS_NAVEGACAO = (
+        Qt.Key.Key_Left,
+        Qt.Key.Key_Right,
+        Qt.Key.Key_Up,
+        Qt.Key.Key_Down,
+        Qt.Key.Key_Home,
+        Qt.Key.Key_End,
     )
 
     def cancelar_multipla(self):
@@ -505,42 +582,104 @@ class EditorTexto(QTextEdit):
             key=lambda c: c.selectionStart(),
         )
 
-        return "\n".join(
-            self._normalizar_busca(c.selectedText())
+        partes = (
+            self._para_texto_puro(c.selectedText())
             for c in cursores
             if c.hasSelection()
         )
 
+        return "\n".join(parte for parte in partes if parte)
+
     def _fundir_duplicados(self):
-        """Remove cursores secundários idênticos entre si ou ao primário."""
+        """
+        Funde cursores que passaram a se sobrepor (ou a ocupar a
+        mesma posição). O resultado de uma fusão mantém a direção
+        do cursor primário, se ele participou, e vira primário.
+        Se nada precisar ser fundido, os cursores existentes são
+        mantidos intactos (preserva a coluna desejada em Up/Down).
+        """
         primario = self.textCursor()
-        vistos = {(primario.anchor(), primario.position())}
-        unicos = []
 
-        for cursor in self._cursores_extras:
-            chave = (cursor.anchor(), cursor.position())
+        entradas = [
+            (c.anchor(), c.position(), False)
+            for c in self._cursores_extras
+        ]
+        entradas.append(
+            (primario.anchor(), primario.position(), True)
+        )
 
-            if chave in vistos:
-                continue
+        entradas.sort(
+            key=lambda e: (min(e[0], e[1]), max(e[0], e[1]))
+        )
 
-            vistos.add(chave)
-            unicos.append(cursor)
+        fundidos = []
 
-        self._cursores_extras = unicos
+        for ancora, posicao, e_primario in entradas:
+            inicio = min(ancora, posicao)
+            fim = max(ancora, posicao)
+
+            if fundidos:
+                ultimo = fundidos[-1]
+                u_inicio, u_fim = ultimo["inicio"], ultimo["fim"]
+
+                sobrepoe = inicio < u_fim or (
+                    inicio == u_fim
+                    and (inicio == fim or u_inicio == u_fim)
+                )
+
+                if sobrepoe:
+                    ultimo["fim"] = max(u_fim, fim)
+
+                    if e_primario or not ultimo["primario"]:
+                        # Direção do primário (ou do primeiro cursor).
+                        if e_primario:
+                            ultimo["direta"] = ancora <= posicao
+                            ultimo["primario"] = True
+
+                    continue
+
+            fundidos.append({
+                "inicio": inicio,
+                "fim": fim,
+                "direta": ancora <= posicao,
+                "primario": e_primario,
+            })
+
+        # Nada fundido: mantém os objetos como estão.
+        if len(fundidos) == len(entradas):
+            return
+
+        documento = self.document()
+        novos = []
+        novo_primario = None
+
+        for item in fundidos:
+            cursor = QTextCursor(documento)
+
+            if item["direta"]:
+                cursor.setPosition(item["inicio"])
+                cursor.setPosition(
+                    item["fim"], QTextCursor.MoveMode.KeepAnchor
+                )
+            else:
+                cursor.setPosition(item["fim"])
+                cursor.setPosition(
+                    item["inicio"], QTextCursor.MoveMode.KeepAnchor
+                )
+
+            if item["primario"]:
+                novo_primario = cursor
+            else:
+                novos.append(cursor)
+
+        self._cursores_extras = novos
+
+        if novo_primario is not None:
+            self.setTextCursor(novo_primario)
 
         # Sobrou só o primário: volta ao modo convencional.
-        if not unicos:
+        if not novos:
             self.cancelar_multipla()
-
-    @staticmethod
-    def _normalizar_busca(texto: str) -> str:
-        """Representa o texto como toPlainText() o representa."""
-        return (
-            texto
-            .replace("\u2029", "\n")
-            .replace("\u2028", "\n")
-            .replace("\u00a0", " ")
-        )
 
     @staticmethod
     def _e_caractere_de_palavra(c: str) -> bool:
@@ -651,6 +790,14 @@ class EditorTexto(QTextEdit):
                     cursor.selectionEnd(),
                 )
             )
+        else:
+            # Depois de navegar com Shift+setas, o primário pode ter
+            # uma seleção diferente da original: ela vira o novo alvo.
+            atual = self._normalizar_busca(texto)
+
+            if atual != self._texto_alvo:
+                self._texto_alvo = atual
+                self._palavra_inteira = False
 
         ocupados = [
             (c.selectionStart(), c.selectionEnd())
@@ -675,6 +822,45 @@ class EditorTexto(QTextEdit):
         self.setTextCursor(achado)
         self.ensureCursorVisible()
         self._atualizar_destaques()
+
+    # --------------------------------------------------------
+    # Proteção das imagens nas edições múltiplas
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _selecao_toca_imagem(cursor: QTextCursor) -> bool:
+        return (
+            cursor.hasSelection()
+            and "\ufffc" in cursor.selectedText()
+        )
+
+    def _em_bloco_com_imagem(self, cursor: QTextCursor) -> bool:
+        return self.bloco_contem_imagem(cursor.block())
+
+    def _inserir_texto_seguro(self, cursor: QTextCursor, texto: str):
+        """Insere texto, mas nunca sobre imagens nem no parágrafo delas."""
+        if (
+            self._selecao_toca_imagem(cursor)
+            or self._em_bloco_com_imagem(cursor)
+        ):
+            return
+
+        cursor.insertText(texto)
+
+    def _inserir_bloco_seguro(self, cursor: QTextCursor):
+        if (
+            self._selecao_toca_imagem(cursor)
+            or self._em_bloco_com_imagem(cursor)
+        ):
+            return
+
+        cursor.insertBlock()
+
+    def _remover_selecao_segura(self, cursor: QTextCursor):
+        if self._selecao_toca_imagem(cursor):
+            return
+
+        cursor.removeSelectedText()
 
     def _executar_em_todos(self, operacao):
         """
@@ -734,7 +920,7 @@ class EditorTexto(QTextEdit):
 
     def _apagar(self, cursor, para_tras: bool):
         if cursor.hasSelection():
-            cursor.removeSelectedText()
+            self._remover_selecao_segura(cursor)
             return
 
         if self._apagaria_imagem(cursor, para_tras):
@@ -744,6 +930,82 @@ class EditorTexto(QTextEdit):
             cursor.deletePreviousChar()
         else:
             cursor.deleteChar()
+
+    # --------------------------------------------------------
+    # Navegação simultânea (setas, Home, End)
+    # --------------------------------------------------------
+
+    @staticmethod
+    def _mover_cursor(cursor, chave, estender: bool, por_palavra: bool):
+        """Move UM cursor como o editor nativo (e o VS Code) faria."""
+        operacao = QTextCursor.MoveOperation
+        modo = (
+            QTextCursor.MoveMode.KeepAnchor
+            if estender
+            else QTextCursor.MoveMode.MoveAnchor
+        )
+
+        if chave == Qt.Key.Key_Left:
+            # Com seleção e sem Shift, recolhe para o início dela.
+            if cursor.hasSelection() and not estender and not por_palavra:
+                cursor.setPosition(cursor.selectionStart())
+            else:
+                cursor.movePosition(
+                    operacao.PreviousWord if por_palavra
+                    else operacao.Left,
+                    modo,
+                )
+
+        elif chave == Qt.Key.Key_Right:
+            if cursor.hasSelection() and not estender and not por_palavra:
+                cursor.setPosition(cursor.selectionEnd())
+            else:
+                cursor.movePosition(
+                    operacao.NextWord if por_palavra
+                    else operacao.Right,
+                    modo,
+                )
+
+        elif chave == Qt.Key.Key_Up:
+            # Na primeira linha, vai ao início dela.
+            if not cursor.movePosition(operacao.Up, modo):
+                cursor.movePosition(operacao.StartOfLine, modo)
+
+        elif chave == Qt.Key.Key_Down:
+            # Na última linha, vai ao fim dela.
+            if not cursor.movePosition(operacao.Down, modo):
+                cursor.movePosition(operacao.EndOfLine, modo)
+
+        elif chave == Qt.Key.Key_Home:
+            cursor.movePosition(operacao.StartOfLine, modo)
+
+        elif chave == Qt.Key.Key_End:
+            cursor.movePosition(operacao.EndOfLine, modo)
+
+    def _navegar_todos(self, chave, estender: bool, por_palavra: bool):
+        """
+        Move todos os cursores ao mesmo tempo. Cada um parte da sua
+        própria posição, então as posições relativas são preservadas;
+        cursores que se encontram (ou se sobrepõem) são fundidos.
+        """
+        primario = QTextCursor(self.textCursor())
+        todos = [*self._cursores_extras, primario]
+
+        for cursor in todos:
+            self._mover_cursor(cursor, chave, estender, por_palavra)
+
+        self._cursores_extras = [
+            c for c in todos if c is not primario
+        ]
+
+        self.setTextCursor(primario)
+        self._fundir_duplicados()
+        self._atualizar_destaques()
+        self.ensureCursorVisible()
+
+    # --------------------------------------------------------
+    # Teclado do modo múltiplo
+    # --------------------------------------------------------
 
     def _tratar_tecla_multipla(self, evento) -> bool:
         """
@@ -756,6 +1018,7 @@ class EditorTexto(QTextEdit):
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         alt = bool(mods & Qt.KeyboardModifier.AltModifier)
         meta = bool(mods & Qt.KeyboardModifier.MetaModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
 
         # Ctrl+D (funciona dentro e fora do modo múltiplo).
         if (
@@ -778,11 +1041,24 @@ class EditorTexto(QTextEdit):
             self.cancelar_multipla()
             return True
 
+        # Navegação: move todos os cursores, sem encerrar o modo.
+        # Ctrl+←/→ andam por palavra; Alt/Meta e Ctrl+Home/End/↑/↓
+        # seguem o fluxo normal (encerram o modo).
+        if chave in self._TECLAS_NAVEGACAO:
+            por_palavra = ctrl and chave in (
+                Qt.Key.Key_Left,
+                Qt.Key.Key_Right,
+            )
+
+            if not alt and not meta and (not ctrl or por_palavra):
+                self._navegar_todos(chave, shift, por_palavra)
+                return True
+
         if evento.matches(QKeySequence.StandardKey.Copy):
             texto = self._texto_das_selecoes()
 
             if texto:
-                QApplication.clipboard().setText(texto)
+                self.definir_area_de_transferencia(texto)
 
             return True
 
@@ -790,9 +1066,9 @@ class EditorTexto(QTextEdit):
             texto = self._texto_das_selecoes()
 
             if texto:
-                QApplication.clipboard().setText(texto)
+                self.definir_area_de_transferencia(texto)
                 self._executar_em_todos(
-                    lambda c: c.removeSelectedText()
+                    self._remover_selecao_segura
                 )
 
             return True
@@ -802,7 +1078,7 @@ class EditorTexto(QTextEdit):
                 QApplication.clipboard().mimeData()
             )
             return True
-        
+
         if not atalho:
             if chave == Qt.Key.Key_Backspace:
                 self._executar_em_todos(
@@ -817,18 +1093,18 @@ class EditorTexto(QTextEdit):
                 return True
 
             if chave in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self._executar_em_todos(lambda c: c.insertBlock())
+                self._executar_em_todos(self._inserir_bloco_seguro)
                 return True
 
             texto = evento.text()
 
             if texto and texto.isprintable():
                 self._executar_em_todos(
-                    lambda c: c.insertText(texto)
+                    lambda c: self._inserir_texto_seguro(c, texto)
                 )
                 return True
 
-        # Qualquer outra tecla (setas, Home/End, Ctrl+Z, Ctrl+A, Tab...)
+        # Qualquer outra tecla (Ctrl+Z, Ctrl+Y, Ctrl+A, Tab, PageUp...)
         # encerra o modo e segue o fluxo normal do editor.
         self.cancelar_multipla()
         return False
@@ -839,13 +1115,11 @@ class EditorTexto(QTextEdit):
         if not self._multi_ativo:
             return
 
-        # Desenha o caret das seleções secundárias já vazias.
+        # Desenha o caret de cada cursor secundário (com ou sem
+        # seleção); o do primário é desenhado pelo próprio Qt.
         pintor = QPainter(self.viewport())
 
         for cursor in self._cursores_extras:
-            if cursor.hasSelection():
-                continue
-
             retangulo = self.cursorRect(cursor)
 
             pintor.fillRect(
@@ -857,7 +1131,7 @@ class EditorTexto(QTextEdit):
             )
 
         pintor.end()
-        
+
     def imagem_na_posicao(self, ponto: QPoint):
         """
         Retorna (posição, id) se o ponto (coordenadas do viewport)
@@ -946,6 +1220,164 @@ class EditorTexto(QTextEdit):
             return True
 
         return super().viewportEvent(evento)
+
+    # --------------------------------------------------------
+    # Zoom (Ctrl + Scroll)
+    # --------------------------------------------------------
+    #
+    # O zoom altera (1) a fonte padrão do documento, que vale para
+    # todo texto sem tamanho explícito, e (2) proporcionalmente, os
+    # tamanhos explícitos (ex.: texto colado do Word/HTML). Só o
+    # tamanho muda: negrito, itálico, cores etc. são preservados
+    # (mergeCharFormat) e as imagens não são tocadas.
+
+    def _tamanho_fonte_atual(self) -> float:
+        if self._zoom_pt is not None:
+            return self._zoom_pt
+
+        fonte = self.document().defaultFont()
+        tamanho = fonte.pointSizeF()
+
+        if tamanho <= 0:
+            tamanho = QFontInfo(fonte).pointSizeF()
+
+        return tamanho if tamanho > 0 else 10.0
+
+    def alterar_zoom(self, passos: int):
+        """Aumenta (passos > 0) ou diminui (passos < 0) o zoom."""
+        atual = self._tamanho_fonte_atual()
+
+        novo = min(
+            max(atual + passos * ZOOM_PASSO, ZOOM_MINIMO),
+            ZOOM_MAXIMO,
+        )
+
+        if abs(novo - atual) < 0.01:
+            return
+
+        self._definir_tamanho_fonte(atual, novo)
+
+    def _definir_tamanho_fonte(self, atual: float, novo: float):
+        razao = novo / atual
+
+        documento = self.document()
+        fonte = documento.defaultFont()
+        fonte.setPointSizeF(novo)
+        documento.setDefaultFont(fonte)
+
+        self._zoom_pt = novo
+        self._escalar_tamanhos_explicitos(razao)
+
+        self.viewport().update()
+
+    def _escalar_tamanhos_explicitos(self, razao: float):
+        """
+        Multiplica por `razao` os tamanhos explícitos de fonte dos
+        fragmentos (pt ou px), preservando as diferenças relativas.
+        Só mexe no documento se houver tamanhos explícitos.
+        """
+        alteracoes = []
+        bloco = self.document().begin()
+
+        while bloco.isValid():
+            for fragmento in self.fragmentos(bloco):
+                formato = fragmento.charFormat()
+
+                if formato.isImageFormat():
+                    continue
+
+                if formato.hasProperty(
+                    QTextFormat.Property.FontPointSize
+                ):
+                    alteracoes.append((
+                        fragmento.position(),
+                        fragmento.length(),
+                        "pt",
+                        formato.fontPointSize(),
+                    ))
+                elif formato.hasProperty(
+                    QTextFormat.Property.FontPixelSize
+                ):
+                    alteracoes.append((
+                        fragmento.position(),
+                        fragmento.length(),
+                        "px",
+                        formato.intProperty(
+                            QTextFormat.Property.FontPixelSize
+                        ),
+                    ))
+
+            bloco = bloco.next()
+
+        if not alteracoes:
+            return
+
+        cursor = QTextCursor(self.document())
+        cursor.beginEditBlock()
+
+        for posicao, tamanho, tipo, valor in alteracoes:
+            cursor.setPosition(posicao)
+            cursor.setPosition(
+                posicao + tamanho,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+
+            formato = QTextCharFormat()
+
+            if tipo == "pt":
+                formato.setFontPointSize(max(valor * razao, 1.0))
+            else:
+                formato.setProperty(
+                    QTextFormat.Property.FontPixelSize,
+                    max(round(valor * razao), 1),
+                )
+
+            cursor.mergeCharFormat(formato)
+
+        cursor.endEditBlock()
+
+    def _reaplicar_zoom_ao_documento(self):
+        """Mantém o zoom se o Qt/tema redefinir a fonte do widget."""
+        zoom = getattr(self, "_zoom_pt", None)
+
+        if zoom is None:
+            return
+
+        fonte = self.document().defaultFont()
+
+        if abs(fonte.pointSizeF() - zoom) > 0.01:
+            fonte.setPointSizeF(zoom)
+            self.document().setDefaultFont(fonte)
+
+    def changeEvent(self, evento):
+        super().changeEvent(evento)
+
+        if evento.type() == QEvent.Type.FontChange:
+            self._reaplicar_zoom_ao_documento()
+
+    def wheelEvent(self, evento):
+        if evento.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = evento.angleDelta().y()
+
+            if delta:
+                # Acumula para suportar mouses de alta resolução
+                # e touchpads (deltas menores que 120).
+                self._acumulado_roda += delta
+                passos = int(
+                    self._acumulado_roda / UNIDADES_POR_CLIQUE_RODA
+                )
+
+                if passos:
+                    self._acumulado_roda -= (
+                        passos * UNIDADES_POR_CLIQUE_RODA
+                    )
+                    self.alterar_zoom(passos)
+
+            evento.accept()
+            return
+
+        self._acumulado_roda = 0
+        super().wheelEvent(evento)
 
     # --------------------------------------------------------
     # Teclado
@@ -1039,12 +1471,8 @@ class EditorTexto(QTextEdit):
                 return
 
         super().keyPressEvent(evento)
-    
-    # --------------------------------------------------------
-    # Área de transferência
-    # --------------------------------------------------------
 
-        # --------------------------------------------------------
+    # --------------------------------------------------------
     # Planilhas (Excel, Calc, Google Sheets...)
     # --------------------------------------------------------
 
@@ -1087,7 +1515,11 @@ class EditorTexto(QTextEdit):
         mime = QMimeData()
         mime.setText(texto)
         return mime
-    
+
+    # --------------------------------------------------------
+    # Área de transferência
+    # --------------------------------------------------------
+
     def canInsertFromMimeData(self, source: QMimeData):
         return source.hasImage() or super().canInsertFromMimeData(
             source
@@ -1108,7 +1540,7 @@ class EditorTexto(QTextEdit):
 
                 if texto:
                     self._executar_em_todos(
-                        lambda c: c.insertText(texto)
+                        lambda c: self._inserir_texto_seguro(c, texto)
                     )
 
                 return
@@ -1136,14 +1568,19 @@ class EditorTexto(QTextEdit):
         super().insertFromMimeData(source)
 
     def createMimeDataFromSelection(self):
-        # Modo múltiplo: copia os textos de todas as seleções.
+        """
+        Tudo o que o editor envia à área de transferência (Ctrl+C,
+        Ctrl+X, menu de contexto, arrastar) passa por aqui. O
+        resultado é SEMPRE texto puro, exceto quando só uma imagem
+        está selecionada (aí vai a própria imagem).
+        O documento em si não é alterado.
+        """
+        # Modo múltiplo: texto de todas as seleções, em ordem.
         if self._multi_ativo:
             texto = self._texto_das_selecoes()
 
             if texto:
-                mime = QMimeData()
-                mime.setText(texto)
-                return mime
+                return self._mime_somente_texto(texto)
 
         # Copiar/recortar uma imagem selecionada coloca a própria
         # imagem na área de transferência. Ao colar, ela vira uma
@@ -1159,7 +1596,11 @@ class EditorTexto(QTextEdit):
                 mime.setImageData(self.imagens[ids[0]])
                 return mime
 
-        return super().createMimeDataFromSelection()
+        # Demais casos: somente text/plain (sem HTML, fontes, cores,
+        # imagens incorporadas ou formatos proprietários).
+        return self._mime_somente_texto(
+            self._texto_puro_do_cursor(cursor)
+        )
 
 
 class EditorTranscricao(QWidget):
@@ -1216,7 +1657,6 @@ class EditorTranscricao(QWidget):
     def limpar(self):
         self.editor_texto.limpar_conteudo()
         self.editor_texto.setFocus()
-
 
 
 class NotaWidget(QWidget):
@@ -1353,7 +1793,6 @@ class NotaWidget(QWidget):
 
         self.aplicar_tema(self._paleta)
         self._atualizar_barra_acoes()
-
 
     def _criar_focus_handler(self, handler_original):
         def handler(evento):
@@ -1536,20 +1975,17 @@ class NotaWidget(QWidget):
         trabalhador.deleteLater()
 
     def copiar_texto(self):
+        """
+        Copia SOMENTE texto puro: todas as seleções (Ctrl+D), a
+        seleção atual ou, sem seleção, o conteúdo inteiro da nota.
+        """
         editor = self.editor.editor_texto
-        cursor = editor.textCursor()
+        texto = editor.texto_para_copiar()
 
-        if cursor.hasSelection():
-            texto = cursor.selection().toPlainText()
-        else:
-            texto = editor.toPlainText()
-
-        texto = texto.replace("\ufffc", "").strip()
-
-        if not texto:
+        if not texto.strip():
             return
 
-        QApplication.clipboard().setText(texto)
+        editor.definir_area_de_transferencia(texto)
 
         self.janela_principal.statusBar().showMessage(
             f"Texto da Nota {self.numero} copiado."
@@ -1602,9 +2038,6 @@ class NotaWidget(QWidget):
         if texto:
             editor = self.editor.editor_texto
             editor.setFocus()
-            editor.insertFromMimeData(
-                QMimeData()
-            ) if False else None
 
             if editor.bloco_contem_imagem(
                 editor.textCursor().block()
@@ -1907,7 +2340,6 @@ class JanelaPrincipal(QMainWindow):
             return
 
         evento.accept()
-
 
 
 # ============================================================
