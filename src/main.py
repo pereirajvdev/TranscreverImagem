@@ -1,3 +1,19 @@
+"""TranscreverImagem: editor de notas com transcrição de imagens (OCR).
+
+Atalhos:
+    Ctrl+O             abrir imagens na nota ativa
+    Ctrl+Shift+C       copiar o texto da nota ativa
+    Ctrl+Shift+V       colagem especial (Paste from Sheet)
+    Ctrl+Shift+T       alternar tema claro/escuro
+    Ctrl+D             seleção múltipla no editor
+    Ctrl + roda        zoom do editor
+
+Notas:
+    Arraste o cabeçalho de uma nota para reordená-la.
+    Ao fechar uma nota com o mouse, o espaço dela é mantido até o
+    cursor sair do botão X (as demais notas não se movem antes disso).
+"""
+
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -13,11 +29,13 @@ from PySide6.QtCore import (
     QThread,
     Signal,
     QBuffer,
+    QByteArray,
     QIODevice,
     QMimeData,
     QEvent,
     QPoint,
     QPointF,
+    QRect,
     QRectF,
     QUrl,
     QSize,
@@ -25,6 +43,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QDrag,
     QImage,
     QPainter,
     QPixmap,
@@ -43,6 +62,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -61,6 +81,8 @@ from temas import (
     montar_palette,
     repolir,
 )
+from colagem import DialogoColagemEspecial
+from ordenacao import calcular_slot, indice_destino
 
 # ============================================================
 # CONFIGURAÇÕES
@@ -86,6 +108,12 @@ ZOOM_PASSO = 1.0
 
 # Um "clique" da roda do mouse equivale a 120 unidades.
 UNIDADES_POR_CLIQUE_RODA = 120
+
+# Formato MIME do arraste de notas (carrega o número da nota).
+MIME_NOTA = "application/x-transcreverimagem-nota"
+
+# Acima deste número de colunas, a colagem de planilha pede confirmação.
+LIMITE_CONFIRMAR_NOTAS = 10
 
 if CAMINHO_TESSERACT.exists():
     pytesseract.pytesseract.tesseract_cmd = str(
@@ -1473,6 +1501,56 @@ class EditorTexto(QTextEdit):
         super().keyPressEvent(evento)
 
     # --------------------------------------------------------
+    # Arraste de notas sobre o editor
+    # --------------------------------------------------------
+    #
+    # O QTextEdit aceita drops por conta própria; para que o arraste
+    # de uma nota continue funcionando por cima dele, os eventos com o
+    # formato MIME_NOTA são repassados à AreaNotas.
+
+    def _area_de_notas(self):
+        pai = self.parentWidget()
+
+        while pai is not None and not isinstance(pai, AreaNotas):
+            pai = pai.parentWidget()
+
+        return pai
+
+    def _encaminhar_arraste_de_nota(self, evento, soltar=False) -> bool:
+        if not evento.mimeData().hasFormat(MIME_NOTA):
+            return False
+
+        area = self._area_de_notas()
+
+        if area is None:
+            evento.ignore()
+            return True
+
+        ponto = self.viewport().mapTo(area, evento.position().toPoint())
+        area.tratar_arraste(evento, ponto, soltar)
+        return True
+
+    def dragEnterEvent(self, evento):
+        if not self._encaminhar_arraste_de_nota(evento):
+            super().dragEnterEvent(evento)
+
+    def dragMoveEvent(self, evento):
+        if not self._encaminhar_arraste_de_nota(evento):
+            super().dragMoveEvent(evento)
+
+    def dropEvent(self, evento):
+        if not self._encaminhar_arraste_de_nota(evento, soltar=True):
+            super().dropEvent(evento)
+
+    def dragLeaveEvent(self, evento):
+        area = self._area_de_notas()
+
+        if area is not None:
+            area.ocultar_destino()
+
+        super().dragLeaveEvent(evento)
+
+    # --------------------------------------------------------
     # Planilhas (Excel, Calc, Google Sheets...)
     # --------------------------------------------------------
 
@@ -1659,6 +1737,211 @@ class EditorTranscricao(QWidget):
         self.editor_texto.setFocus()
 
 
+class CabecalhoNota(QWidget):
+    """Cabeçalho da nota; arrastá-lo inicia a reordenação."""
+
+    arraste_solicitado = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._origem_clique = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def mousePressEvent(self, evento):
+        if evento.button() == Qt.MouseButton.LeftButton:
+            self._origem_clique = evento.position().toPoint()
+            evento.accept()
+            return
+
+        super().mousePressEvent(evento)
+
+    def mouseMoveEvent(self, evento):
+        if (
+            self._origem_clique is not None
+            and evento.buttons() & Qt.MouseButton.LeftButton
+        ):
+            deslocamento = (
+                evento.position().toPoint() - self._origem_clique
+            )
+
+            if (
+                deslocamento.manhattanLength()
+                >= QApplication.startDragDistance()
+            ):
+                self._origem_clique = None
+                self.arraste_solicitado.emit()
+                return
+
+        super().mouseMoveEvent(evento)
+
+    def mouseReleaseEvent(self, evento):
+        self._origem_clique = None
+        super().mouseReleaseEvent(evento)
+
+
+class VagaNota(QWidget):
+    """Espaço reservado no lugar de uma nota recém-fechada.
+
+    Mantém a largura da nota (mesmo stretch no layout) para que as
+    demais não mudem de tamanho nem de posição enquanto o cursor
+    estiver sobre a região do botão X. Quando o cursor sai dessa
+    região (ou da vaga), emite `liberada` uma única vez.
+    """
+
+    liberada = Signal()
+
+    def __init__(self, dist_direita, topo, largura, altura, parent=None):
+        super().__init__(parent)
+
+        self._dist_direita = dist_direita
+        self._topo = topo
+        self._largura = largura
+        self._altura = altura
+        self._liberada = False
+
+        self.setObjectName("vagaNota")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMouseTracking(True)
+
+    def zona_botao(self) -> QRect:
+        """Onde o botão X estava, em coordenadas desta vaga."""
+        return QRect(
+            self.width() - self._dist_direita - self._largura,
+            self._topo,
+            self._largura,
+            self._altura,
+        )
+
+    def _liberar(self):
+        if not self._liberada:
+            self._liberada = True
+            self.liberada.emit()
+
+    def mouseMoveEvent(self, evento):
+        if not self.zona_botao().contains(evento.position().toPoint()):
+            self._liberar()
+
+        super().mouseMoveEvent(evento)
+
+    def leaveEvent(self, evento):
+        self._liberar()
+        super().leaveEvent(evento)
+
+
+class AreaNotas(QWidget):
+    """Contêiner horizontal das notas; aceita soltar notas arrastadas."""
+
+    # (número da nota arrastada, slot de inserção)
+    nota_solta = Signal(int, int)
+
+    _LARGURA_INDICADOR = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setObjectName("areaNotas")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
+
+        self._fonte_notas = lambda: []
+
+        # Barra que marca onde a nota será inserida.
+        self.indicador = QWidget(self)
+        self.indicador.setObjectName("indicadorInsercao")
+        self.indicador.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground, True
+        )
+        self.indicador.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self.indicador.hide()
+
+    def definir_fonte_notas(self, fonte):
+        """`fonte()` devolve as notas na ordem visual."""
+        self._fonte_notas = fonte
+
+    def _numero_valido(self, mime):
+        if not mime.hasFormat(MIME_NOTA):
+            return None
+
+        try:
+            numero = int(bytes(mime.data(MIME_NOTA)).decode())
+        except ValueError:
+            return None
+
+        existe = any(n.numero == numero for n in self._fonte_notas())
+        return numero if existe else None
+
+    def slot_em(self, x: int) -> int:
+        centros = [
+            nota.geometry().center().x() for nota in self._fonte_notas()
+        ]
+        return calcular_slot(centros, x)
+
+    def mostrar_destino(self, slot: int):
+        notas = self._fonte_notas()
+
+        if not notas:
+            self.ocultar_destino()
+            return
+
+        if slot <= 0:
+            x = notas[0].geometry().left()
+        elif slot >= len(notas):
+            x = notas[-1].geometry().right() + 1
+        else:
+            x = (
+                notas[slot - 1].geometry().right()
+                + 1
+                + notas[slot].geometry().left()
+            ) // 2
+
+        largura = self._LARGURA_INDICADOR
+        esquerda = min(max(x - largura // 2, 0), self.width() - largura)
+
+        self.indicador.setGeometry(esquerda, 0, largura, self.height())
+        self.indicador.show()
+        self.indicador.raise_()
+
+    def ocultar_destino(self):
+        self.indicador.hide()
+
+    def tratar_arraste(self, evento, ponto, soltar=False):
+        """Entrada comum dos eventos de arraste (da área ou do editor)."""
+        numero = self._numero_valido(evento.mimeData())
+
+        if numero is None:
+            self.ocultar_destino()
+            evento.ignore()
+            return
+
+        slot = self.slot_em(ponto.x())
+
+        evento.setDropAction(Qt.DropAction.MoveAction)
+        evento.accept()
+
+        if soltar:
+            self.ocultar_destino()
+            self.nota_solta.emit(numero, slot)
+        else:
+            self.mostrar_destino(slot)
+
+    def dragEnterEvent(self, evento):
+        self.tratar_arraste(evento, evento.position().toPoint())
+
+    def dragMoveEvent(self, evento):
+        self.tratar_arraste(evento, evento.position().toPoint())
+
+    def dragLeaveEvent(self, evento):
+        self.ocultar_destino()
+
+    def dropEvent(self, evento):
+        self.tratar_arraste(
+            evento, evento.position().toPoint(), soltar=True
+        )
+
+
 class NotaWidget(QWidget):
 
     def __init__(self, numero: int, janela_principal, parent=None):
@@ -1688,8 +1971,12 @@ class NotaWidget(QWidget):
         layout.setSpacing(0)
 
         # Cabeçalho da nota
-        self.cabecalho_nota = QWidget(self)
+        self.cabecalho_nota = CabecalhoNota(self)
         self.cabecalho_nota.setObjectName("cabecalhoNota")
+        self.cabecalho_nota.setToolTip("Arraste para reordenar")
+        self.cabecalho_nota.arraste_solicitado.connect(
+            self._iniciar_arraste
+        )
         self.cabecalho_nota.setAttribute(
             Qt.WidgetAttribute.WA_StyledBackground, True
         )
@@ -2050,6 +2337,54 @@ class NotaWidget(QWidget):
                 f"Conteúdo colado na Nota {self.numero}."
             )
 
+    def zona_botao_fechar(self):
+        """(distância à borda direita, topo, largura, altura) do X."""
+        canto = self.botao_fechar.mapTo(self, QPoint(0, 0))
+        largura = self.botao_fechar.width()
+
+        return (
+            self.width() - canto.x() - largura,
+            canto.y(),
+            largura,
+            self.botao_fechar.height(),
+        )
+
+    def _iniciar_arraste(self):
+        """Inicia o arraste desta nota (QDrag nativo do Qt)."""
+        self.janela_principal.preparar_arraste()
+
+        # Miniatura translúcida da nota, presa pelo topo.
+        miniatura = self.grab().scaledToWidth(
+            min(240, max(self.width(), 1)),
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        translucida = QPixmap(miniatura.size())
+        translucida.fill(Qt.GlobalColor.transparent)
+
+        pintor = QPainter(translucida)
+        pintor.setOpacity(0.8)
+        pintor.drawPixmap(0, 0, miniatura)
+        pintor.end()
+
+        mime = QMimeData()
+        mime.setData(MIME_NOTA, QByteArray(str(self.numero).encode()))
+
+        arraste = QDrag(self.cabecalho_nota)
+        arraste.setMimeData(mime)
+        arraste.setPixmap(translucida)
+        arraste.setHotSpot(QPoint(translucida.width() // 2, 14))
+
+        # A nota de origem fica esmaecida enquanto é arrastada.
+        efeito = QGraphicsOpacityEffect(self)
+        efeito.setOpacity(0.45)
+        self.setGraphicsEffect(efeito)
+
+        try:
+            arraste.exec(Qt.DropAction.MoveAction)
+        finally:
+            self.setGraphicsEffect(None)
+            self.janela_principal.finalizar_arraste()
+
     def fechar_nota(self):
         if (
             self.transcritor is not None
@@ -2078,6 +2413,7 @@ class JanelaPrincipal(QMainWindow):
         self.notas = []
         self._nota_ativa = None
         self.proximo_numero_nota = 1
+        self._vagas = []
 
         self.temas = GerenciadorTemas(self)
         self.temas.tema_alterado.connect(self.aplicar_tema)
@@ -2169,11 +2505,9 @@ class JanelaPrincipal(QMainWindow):
 
         # Área horizontal das notas: o fundo é a cor da borda e o
         # espaçamento de 1 px vira o divisor entre os painéis.
-        self.area_notas = QWidget(central)
-        self.area_notas.setObjectName("areaNotas")
-        self.area_notas.setAttribute(
-            Qt.WidgetAttribute.WA_StyledBackground, True
-        )
+        self.area_notas = AreaNotas(central)
+        self.area_notas.definir_fonte_notas(lambda: self.notas)
+        self.area_notas.nota_solta.connect(self.mover_nota)
 
         self.layout_notas = QHBoxLayout(self.area_notas)
         self.layout_notas.setContentsMargins(0, 0, 0, 0)
@@ -2186,7 +2520,21 @@ class JanelaPrincipal(QMainWindow):
 
         self.statusBar().setSizeGripEnabled(False)
 
-    def adicionar_nota(self):
+    # --------------------------------------------------------
+    # Criação, fechamento e ordem das notas
+    # --------------------------------------------------------
+    #
+    # `self.notas` é a única fonte de verdade da ordem; o layout é
+    # sempre reflexo dela. As notas são identificadas por `numero`
+    # (estável, nunca reaproveitado), jamais pela posição.
+
+    def criar_nota(self, indice=None, texto=None):
+        """Cria uma nota na posição `indice` (padrão: no fim)."""
+        self._colapsar_vagas()
+
+        if indice is None or not 0 <= indice <= len(self.notas):
+            indice = len(self.notas)
+
         nota = NotaWidget(
             self.proximo_numero_nota,
             self,
@@ -2195,13 +2543,19 @@ class JanelaPrincipal(QMainWindow):
 
         self.proximo_numero_nota += 1
 
-        self.notas.append(nota)
-        self.nota_ativa = nota
+        self.notas.insert(indice, nota)
+        self.layout_notas.insertWidget(indice, nota, stretch=1)
 
-        self.layout_notas.addWidget(
-            nota,
-            stretch=1,
-        )
+        if texto:
+            editor = nota.editor.editor_texto
+            editor.setPlainText(texto)
+            editor.document().clearUndoRedoStacks()
+
+        return nota
+
+    def adicionar_nota(self):
+        nota = self.criar_nota()
+        self.nota_ativa = nota
 
         nota.editor.editor_texto.setFocus()
 
@@ -2209,15 +2563,40 @@ class JanelaPrincipal(QMainWindow):
             f"Nota {nota.numero} criada."
         )
 
-    def remover_nota(self, nota):
+    def remover_nota(self, nota, manter_vaga=None):
+        """Fecha a nota.
+
+        Se o cursor está sobre o botão X, o espaço dela é mantido
+        (VagaNota) até o cursor sair dali. `manter_vaga` força o
+        comportamento (útil em testes); None detecta pelo mouse.
+        """
         if nota not in self.notas:
             return
+
+        self._colapsar_vagas()
+
+        if manter_vaga is None:
+            manter_vaga = nota.botao_fechar.underMouse()
+
+        manter_vaga = manter_vaga and len(self.notas) > 1
+
+        indice = self.layout_notas.indexOf(nota)
+        zona = nota.zona_botao_fechar()
 
         self.layout_notas.removeWidget(nota)
         self.notas.remove(nota)
 
         nota.hide()
         nota.deleteLater()
+
+        if manter_vaga:
+            vaga = VagaNota(*zona, parent=self.area_notas)
+            vaga.liberada.connect(
+                lambda v=vaga: self._colapsar_vaga(v)
+            )
+
+            self._vagas.append(vaga)
+            self.layout_notas.insertWidget(indice, vaga, stretch=1)
 
         if self.nota_ativa is nota:
             self.nota_ativa = (
@@ -2229,6 +2608,122 @@ class JanelaPrincipal(QMainWindow):
 
         self.statusBar().showMessage(
             "Nota removida."
+        )
+
+    def _colapsar_vaga(self, vaga):
+        """Libera o espaço reservado; o layout recalcula as notas."""
+        if vaga not in self._vagas:
+            return
+
+        self._vagas.remove(vaga)
+        self.layout_notas.removeWidget(vaga)
+
+        vaga.hide()
+        vaga.deleteLater()
+
+    def _colapsar_vagas(self):
+        for vaga in list(self._vagas):
+            self._colapsar_vaga(vaga)
+
+    def preparar_arraste(self):
+        # A ordem visual precisa ser igual à ordem dos dados.
+        self._colapsar_vagas()
+
+    def finalizar_arraste(self):
+        self.area_notas.ocultar_destino()
+
+    def mover_nota(self, numero: int, slot: int) -> bool:
+        """Move a nota `numero` para o `slot` de inserção informado."""
+        self._colapsar_vagas()
+
+        origem = next(
+            (i for i, n in enumerate(self.notas) if n.numero == numero),
+            None,
+        )
+
+        if origem is None:
+            return False
+
+        destino = indice_destino(origem, slot)
+
+        if destino == origem:
+            return False
+
+        nota = self.notas.pop(origem)
+        self.notas.insert(destino, nota)
+
+        self.setUpdatesEnabled(False)
+
+        try:
+            self.layout_notas.removeWidget(nota)
+            self.layout_notas.insertWidget(destino, nota, stretch=1)
+        finally:
+            self.setUpdatesEnabled(True)
+
+        self.statusBar().showMessage(
+            f"Nota {numero} movida para a posição {destino + 1}."
+        )
+
+        return True
+
+    # --------------------------------------------------------
+    # Colagem especial
+    # --------------------------------------------------------
+
+    def abrir_colagem_especial(self):
+        dialogo = DialogoColagemEspecial(
+            QGuiApplication.clipboard().text(),
+            self.temas.paleta,
+            self,
+        )
+        dialogo.exec()
+
+        if dialogo.opcao_escolhida == DialogoColagemEspecial.PASTE_FROM_SHEET:
+            self.colar_de_planilha(dialogo.colunas)
+
+    def colar_de_planilha(self, colunas):
+        """Cria uma nota por coluna, logo após a nota ativa."""
+        if not colunas:
+            self.statusBar().showMessage(
+                "Nenhum dado tabular para colar."
+            )
+            return
+
+        if len(colunas) > LIMITE_CONFIRMAR_NOTAS:
+            resposta = QMessageBox.question(
+                self,
+                "Paste from Sheet",
+                f"Serão criadas {len(colunas)} notas. "
+                "Deseja continuar?",
+            )
+
+            if resposta != QMessageBox.StandardButton.Yes:
+                return
+
+        self._colapsar_vagas()
+
+        if self.nota_ativa in self.notas:
+            base = self.notas.index(self.nota_ativa) + 1
+        else:
+            base = len(self.notas)
+
+        novas = []
+
+        self.setUpdatesEnabled(False)
+
+        try:
+            for deslocamento, texto in enumerate(colunas):
+                novas.append(
+                    self.criar_nota(base + deslocamento, texto)
+                )
+        finally:
+            self.setUpdatesEnabled(True)
+
+        self.nota_ativa = novas[0]
+        novas[0].editor.editor_texto.setFocus()
+
+        self.statusBar().showMessage(
+            f"{len(novas)} nota(s) criada(s) a partir da planilha."
         )
 
     def configurar_atalhos(self):
@@ -2253,6 +2748,14 @@ class JanelaPrincipal(QMainWindow):
             self,
         )
         self.atalho_tema.activated.connect(self.alternar_tema)
+
+        self.atalho_colagem_especial = QShortcut(
+            QKeySequence("Ctrl+Shift+V"),
+            self,
+        )
+        self.atalho_colagem_especial.activated.connect(
+            self.abrir_colagem_especial
+        )
 
     def alternar_tema(self):
         self.temas.alternar()
@@ -2359,4 +2862,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()

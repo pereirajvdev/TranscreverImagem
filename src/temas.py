@@ -250,6 +250,17 @@ QWidget#barraAcoes {
     border-top: 1px solid $borda;
 }
 
+/* ---------- Reordenação e vaga de nota fechada ---------- */
+
+QWidget#vagaNota {
+    background-color: $janela;
+}
+
+QWidget#indicadorInsercao {
+    background-color: $destaque;
+    border-radius: 2px;
+}
+
 /* ---------- Editor ---------- */
 
 QWidget#editorTranscricao {
@@ -345,6 +356,22 @@ QPushButton[papel="fechar"]:pressed {
     background-color: $perigo_fundo;
 }
 
+QPushButton[papel="opcao"] {
+    text-align: left;
+    padding: 10px 12px;
+    font-weight: 600;
+}
+
+QLabel#tituloDialogo {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+QLabel#descricaoOpcao {
+    color: $texto_suave;
+    font-size: 12px;
+}
+
 QMessageBox QPushButton {
     min-width: 72px;
 }
@@ -416,4 +443,4 @@ QScrollBar::add-page, QScrollBar::sub-page {
 
 
 def gerar_qss(p: Paleta) -> str:
-    return _MODELO_QSS.substitute(asdict(p))
+    return _MODELO_QSS.substitute(asdict(p))
