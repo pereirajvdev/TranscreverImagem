@@ -7,6 +7,7 @@ Atalhos:
     Ctrl+Shift+T       alternar tema claro/escuro
     Ctrl+D             seleção múltipla no editor
     Ctrl + roda        zoom do editor
+    Ctrl + clique      recorta a linha (a linha permanece, vazia)
 
 Notas:
     Arraste o cabeçalho de uma nota para reordená-la.
@@ -1232,7 +1233,54 @@ class EditorTexto(QTextEdit):
                 evento.accept()
                 return
 
+            # Ctrl + clique (sem outros modificadores): recorta a linha.
+            if evento.modifiers() == Qt.KeyboardModifier.ControlModifier:
+                bloco = self.cursorForPosition(
+                    evento.position().toPoint()
+                ).block()
+
+                self.recortar_linha(bloco)
+                self.setFocus(Qt.FocusReason.MouseFocusReason)
+
+                evento.accept()
+                return
+
         super().mousePressEvent(evento)
+
+    def recortar_linha(self, bloco) -> bool:
+        """Envia o texto da linha (bloco) à área de transferência e
+        o remove, deixando a linha vazia no mesmo lugar.
+
+        Só os caracteres do bloco são removidos: o delimitador de
+        parágrafo (\\n) fica intacto, então o número de linhas e a
+        posição das demais não mudam, inclusive na última linha (onde
+        nenhuma quebra é criada). Uma única edição: Ctrl+Z desfaz.
+        Linhas com imagem são ignoradas, para não perdê-las sem querer.
+        """
+        if not bloco.isValid() or self.bloco_contem_imagem(bloco):
+            QApplication.beep()
+            return False
+
+        texto = self._para_texto_puro(bloco.text())
+
+        # QTextCursor(bloco) começa no início do bloco; EndOfBlock com
+        # KeepAnchor seleciona apenas o texto, sem o separador.
+        cursor = QTextCursor(bloco)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.EndOfBlock,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+
+        if cursor.hasSelection():
+            self.definir_area_de_transferencia(texto)
+            cursor.removeSelectedText()
+
+        # O cursor de edição fica na linha agora vazia.
+        cursor.clearSelection()
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
+        return True
 
     def viewportEvent(self, evento):
         # Mostra o id da imagem ao passar o mouse sobre ela.
