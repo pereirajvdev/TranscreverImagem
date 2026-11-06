@@ -10,8 +10,10 @@ Atalhos:
 
 Notas:
     Arraste o cabeçalho de uma nota para reordená-la.
-    Ao fechar uma nota com o mouse, o espaço dela é mantido até o
-    cursor sair do botão X (as demais notas não se movem antes disso).
+    Ao fechar uma nota com o mouse, as notas à direita deslizam
+    imediatamente para a esquerda (sem mudar de tamanho) e o espaço
+    vazio fica reservado no fim, até o cursor sair do botão X.
+    Paste from Sheet remove antes as notas completamente vazias.
 """
 
 import sys
@@ -43,6 +45,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor,
+    QCursor,
     QDrag,
     QImage,
     QPainter,
@@ -1781,52 +1784,19 @@ class CabecalhoNota(QWidget):
 
 
 class VagaNota(QWidget):
-    """Espaço reservado no lugar de uma nota recém-fechada.
+    """Espaço reservado no fim da fila após fechar uma nota.
 
-    Mantém a largura da nota (mesmo stretch no layout) para que as
-    demais não mudem de tamanho nem de posição enquanto o cursor
-    estiver sobre a região do botão X. Quando o cursor sai dessa
-    região (ou da vaga), emite `liberada` uma única vez.
+    Tem o mesmo stretch das notas, então as notas restantes mantêm
+    seu tamanho. Quem a libera é a JanelaPrincipal, quando o cursor
+    sai da zona do botão X (ver JanelaPrincipal.eventFilter).
     """
 
-    liberada = Signal()
-
-    def __init__(self, dist_direita, topo, largura, altura, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-
-        self._dist_direita = dist_direita
-        self._topo = topo
-        self._largura = largura
-        self._altura = altura
-        self._liberada = False
 
         self.setObjectName("vagaNota")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMouseTracking(True)
-
-    def zona_botao(self) -> QRect:
-        """Onde o botão X estava, em coordenadas desta vaga."""
-        return QRect(
-            self.width() - self._dist_direita - self._largura,
-            self._topo,
-            self._largura,
-            self._altura,
-        )
-
-    def _liberar(self):
-        if not self._liberada:
-            self._liberada = True
-            self.liberada.emit()
-
-    def mouseMoveEvent(self, evento):
-        if not self.zona_botao().contains(evento.position().toPoint()):
-            self._liberar()
-
-        super().mouseMoveEvent(evento)
-
-    def leaveEvent(self, evento):
-        self._liberar()
-        super().leaveEvent(evento)
 
 
 class AreaNotas(QWidget):
@@ -2337,17 +2307,19 @@ class NotaWidget(QWidget):
                 f"Conteúdo colado na Nota {self.numero}."
             )
 
-    def zona_botao_fechar(self):
-        """(distância à borda direita, topo, largura, altura) do X."""
-        canto = self.botao_fechar.mapTo(self, QPoint(0, 0))
-        largura = self.botao_fechar.width()
+    def esta_vazia(self) -> bool:
+        """True se a nota não tem nenhum conteúdo.
 
-        return (
-            self.width() - canto.x() - largura,
-            canto.y(),
-            largura,
-            self.botao_fechar.height(),
-        )
+        Usa o documento do editor: o caractere final do QTextDocument
+        é sempre contado (por isso <= 1), enquanto texto, espaços,
+        quebras de linha e imagens (\ufffc) contam como conteúdo.
+        Nota com transcrição em andamento nunca é considerada vazia.
+        """
+        if self.transcritor is not None and self.transcritor.isRunning():
+            return False
+
+        documento = self.editor.editor_texto.document()
+        return documento.characterCount() <= 1
 
     def _iniciar_arraste(self):
         """Inicia o arraste desta nota (QDrag nativo do Qt)."""
@@ -2414,6 +2386,7 @@ class JanelaPrincipal(QMainWindow):
         self._nota_ativa = None
         self.proximo_numero_nota = 1
         self._vagas = []
+        self._zona_reserva = QRect()  # coordenadas globais
 
         self.temas = GerenciadorTemas(self)
         self.temas.tema_alterado.connect(self.aplicar_tema)
@@ -2563,45 +2536,60 @@ class JanelaPrincipal(QMainWindow):
             f"Nota {nota.numero} criada."
         )
 
-    def remover_nota(self, nota, manter_vaga=None):
-        """Fecha a nota.
+    def _cursor_sobre(self, widget) -> bool:
+        """True se o cursor está dentro do widget (por geometria)."""
+        return widget.isVisible() and widget.rect().contains(
+            widget.mapFromGlobal(QCursor.pos())
+        )
 
-        Se o cursor está sobre o botão X, o espaço dela é mantido
-        (VagaNota) até o cursor sair dali. `manter_vaga` força o
-        comportamento (útil em testes); None detecta pelo mouse.
-        """
-        if nota not in self.notas:
-            return
-
-        self._colapsar_vagas()
-
-        if manter_vaga is None:
-            manter_vaga = nota.botao_fechar.underMouse()
-
-        manter_vaga = manter_vaga and len(self.notas) > 1
-
-        indice = self.layout_notas.indexOf(nota)
-        zona = nota.zona_botao_fechar()
-
+    def _destruir_nota(self, nota):
+        """Retira a nota do layout e da lista, sem efeitos extras."""
         self.layout_notas.removeWidget(nota)
         self.notas.remove(nota)
 
         nota.hide()
         nota.deleteLater()
 
-        if manter_vaga:
-            vaga = VagaNota(*zona, parent=self.area_notas)
-            vaga.liberada.connect(
-                lambda v=vaga: self._colapsar_vaga(v)
-            )
-
-            self._vagas.append(vaga)
-            self.layout_notas.insertWidget(indice, vaga, stretch=1)
-
         if self.nota_ativa is nota:
             self.nota_ativa = (
                 self.notas[-1] if self.notas else None
             )
+
+    def remover_nota(self, nota, manter_vaga=None):
+        """Fecha a nota.
+
+        Com o cursor sobre o botão X, as notas à direita deslizam
+        para a esquerda NA HORA, mantendo o tamanho, e o espaço
+        liberado fica reservado no FIM da fila (VagaNota) até o
+        cursor sair da zona do X. Fechamentos seguidos, com o cursor
+        ainda ali, acumulam vagas no fim. `manter_vaga` força o
+        comportamento (útil em testes); None detecta pelo cursor.
+        """
+        if nota not in self.notas:
+            return
+
+        if manter_vaga is None:
+            manter_vaga = self._cursor_sobre(nota.botao_fechar)
+
+        manter_vaga = manter_vaga and len(self.notas) > 1
+
+        if manter_vaga:
+            botao = nota.botao_fechar
+            self._zona_reserva = QRect(
+                botao.mapToGlobal(QPoint(0, 0)), botao.size()
+            )
+        else:
+            self._colapsar_vagas()
+
+        self._destruir_nota(nota)
+
+        if manter_vaga:
+            if not self._vagas:
+                QApplication.instance().installEventFilter(self)
+
+            vaga = VagaNota(self.area_notas)
+            self._vagas.append(vaga)
+            self.layout_notas.addWidget(vaga, stretch=1)
 
         if not self.notas:
             self.adicionar_nota()
@@ -2609,6 +2597,27 @@ class JanelaPrincipal(QMainWindow):
         self.statusBar().showMessage(
             "Nota removida."
         )
+
+    # Eventos que podem indicar que o cursor deixou a zona do X.
+    _EVENTOS_DE_SAIDA = (
+        QEvent.Type.Enter,
+        QEvent.Type.Leave,
+        QEvent.Type.MouseMove,
+        QEvent.Type.WindowDeactivate,
+    )
+
+    def eventFilter(self, objeto, evento):
+        # Só fica instalado enquanto há vagas reservadas.
+        if self._vagas and evento.type() in self._EVENTOS_DE_SAIDA:
+            self._verificar_saida_da_zona()
+
+        return False
+
+    def _verificar_saida_da_zona(self):
+        if self._vagas and not self._zona_reserva.contains(
+            QCursor.pos()
+        ):
+            self._colapsar_vagas()
 
     def _colapsar_vaga(self, vaga):
         """Libera o espaço reservado; o layout recalcula as notas."""
@@ -2620,6 +2629,9 @@ class JanelaPrincipal(QMainWindow):
 
         vaga.hide()
         vaga.deleteLater()
+
+        if not self._vagas:
+            QApplication.instance().removeEventFilter(self)
 
     def _colapsar_vagas(self):
         for vaga in list(self._vagas):
@@ -2682,7 +2694,7 @@ class JanelaPrincipal(QMainWindow):
             self.colar_de_planilha(dialogo.colunas)
 
     def colar_de_planilha(self, colunas):
-        """Cria uma nota por coluna, logo após a nota ativa."""
+        """Remove as notas vazias e cria uma nota por coluna, no fim."""
         if not colunas:
             self.statusBar().showMessage(
                 "Nenhum dado tabular para colar."
@@ -2702,29 +2714,31 @@ class JanelaPrincipal(QMainWindow):
 
         self._colapsar_vagas()
 
-        if self.nota_ativa in self.notas:
-            base = self.notas.index(self.nota_ativa) + 1
-        else:
-            base = len(self.notas)
-
         novas = []
+        removidas = 0
 
         self.setUpdatesEnabled(False)
 
         try:
-            for deslocamento, texto in enumerate(colunas):
-                novas.append(
-                    self.criar_nota(base + deslocamento, texto)
-                )
+            # Limpeza: remove só as notas completamente vazias.
+            for nota in [n for n in self.notas if n.esta_vazia()]:
+                self._destruir_nota(nota)
+                removidas += 1
+
+            for texto in colunas:
+                novas.append(self.criar_nota(texto=texto))
         finally:
             self.setUpdatesEnabled(True)
 
         self.nota_ativa = novas[0]
         novas[0].editor.editor_texto.setFocus()
 
-        self.statusBar().showMessage(
-            f"{len(novas)} nota(s) criada(s) a partir da planilha."
-        )
+        mensagem = f"{len(novas)} nota(s) criada(s) a partir da planilha."
+
+        if removidas:
+            mensagem += f" {removidas} nota(s) vazia(s) removida(s)."
+
+        self.statusBar().showMessage(mensagem)
 
     def configurar_atalhos(self):
         self.atalho_abrir = QShortcut(
@@ -2862,4 +2876,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()
