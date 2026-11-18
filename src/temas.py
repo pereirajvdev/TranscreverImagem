@@ -250,6 +250,28 @@ QWidget#barraAcoes {
     border-top: 1px solid $borda;
 }
 
+/* ---------- Reordenação e vaga de nota fechada ---------- */
+
+QWidget#vagaNota {
+    background-color: $janela;
+}
+
+QWidget#indicadorInsercao {
+    background-color: $destaque;
+    border-radius: 2px;
+}
+
+/* ---------- Divisória redimensionável entre notas ---------- */
+
+QWidget#divisoriaNota {
+    background-color: transparent;
+}
+
+QWidget#divisoriaNota:hover,
+QWidget#divisoriaNota[arrastando="true"] {
+    background-color: $destaque;
+}
+
 /* ---------- Editor ---------- */
 
 QWidget#editorTranscricao {
@@ -343,6 +365,22 @@ QPushButton[papel="fechar"] {
 QPushButton[papel="fechar"]:hover,
 QPushButton[papel="fechar"]:pressed {
     background-color: $perigo_fundo;
+}
+
+QPushButton[papel="opcao"] {
+    text-align: left;
+    padding: 10px 12px;
+    font-weight: 600;
+}
+
+QLabel#tituloDialogo {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+QLabel#descricaoOpcao {
+    color: $texto_suave;
+    font-size: 12px;
 }
 
 QMessageBox QPushButton {

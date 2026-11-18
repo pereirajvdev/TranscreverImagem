@@ -72,6 +72,13 @@ def _transcrever(p, cor):
     p.drawLine(QPointF(8, 12), QPointF(16, 12))
 
 
+def _planilha(p, cor):
+    p.drawRoundedRect(QRectF(4, 5, 16, 14), 2, 2)
+    p.drawLine(QPointF(4, 10), QPointF(20, 10))
+    p.drawLine(QPointF(4, 14.5), QPointF(20, 14.5))
+    p.drawLine(QPointF(10, 10), QPointF(10, 19))
+
+
 def _logo(p, cor):
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(cor)
@@ -93,6 +100,7 @@ _DESENHOS = {
     "fechar": _fechar,
     "copiar": _copiar,
     "transcrever": _transcrever,
+    "planilha": _planilha,
     "logo": _logo,
 }
 
@@ -152,4 +160,4 @@ def criar_icone_carregando(cor, angulo, tamanho=24) -> QIcon:
         p.translate(-12, -12)
         p.drawArc(QRectF(4, 4, 16, 16), 0, 270 * 16)
 
-    return _montar_icone(desenho, cor, None, tamanho)
+    return _montar_icone(desenho, cor, None, tamanho)
